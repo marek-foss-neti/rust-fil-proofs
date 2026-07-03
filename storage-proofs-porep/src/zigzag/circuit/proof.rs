@@ -31,6 +31,19 @@ pub struct ZigZagCircuit<Tree: MerkleTreeTrait> {
     pub proof: Option<Proof<Tree>>,
 }
 
+impl<Tree: MerkleTreeTrait> Clone for ZigZagCircuit<Tree> {
+    fn clone(&self) -> Self {
+        ZigZagCircuit {
+            public_params: self.public_params.clone(),
+            replica_id: self.replica_id,
+            comm_d: self.comm_d,
+            comm_r: self.comm_r,
+            comm_r_star: self.comm_r_star,
+            proof: self.proof.clone(),
+        }
+    }
+}
+
 impl<Tree: MerkleTreeTrait> CircuitComponent for ZigZagCircuit<Tree> {
     type ComponentPrivateInputs = ();
 }

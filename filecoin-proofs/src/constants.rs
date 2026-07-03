@@ -188,6 +188,11 @@ pub type DefaultOctTree = DiskTree<DefaultTreeHasher, U8, U0, U0>;
 /// persisted to disk, but only cached in memory.
 pub type DefaultOctLCTree = LCTree<DefaultTreeHasher, U8, U0, U0>;
 
+/// The merkle-tree shape used by ZigZag PoRep: a binary Poseidon tree, identical for every sector
+/// size. ZigZag does not use the octree sub/top shapes that Stacked uses, so its Groth16 parameters
+/// are keyed on this single shape regardless of sector size.
+pub type ZigZagTree = DefaultBinaryTree;
+
 // Generic shapes
 pub type SectorShapeBase = LCTree<DefaultTreeHasher, U8, U0, U0>;
 pub type SectorShapeSub2 = LCTree<DefaultTreeHasher, U8, U2, U0>;
