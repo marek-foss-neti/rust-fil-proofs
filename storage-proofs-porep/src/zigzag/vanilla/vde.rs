@@ -1,6 +1,7 @@
-use blake2s_simd::Params as Blake2s;
 use filecoin_hashers::{Domain, Hasher};
 use fr32::bytes_into_fr_repr_safe;
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use sha2::{Digest, Sha256};
 use storage_proofs_core::{
     drgraph::Graph,
     error::Result,
@@ -51,6 +52,12 @@ where
 }
 
 /// Decodes (extracts) all of `data`, returning the original pre-encoding bytes.
+///
+/// This is where ZigZag's fast-extraction asymmetry lives. Unlike [`encode`], which is inherently
+/// sequential (a node cannot be encoded until its parents have been encoded), every node here is
+/// decoded from the *fully-encoded, immutable* replica: [`decode_block`] reads a node's parents from
+/// `data` (never from partially-decoded output), so the nodes are mutually independent and can be
+/// decoded in any order or fully in parallel. We exploit that here with a parallel iterator.
 pub fn decode<H, G>(
     graph: &ZigZagGraph<H, G>,
     replica_id: &H::Domain,
@@ -60,13 +67,23 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
-    (0..graph.size()).try_fold(Vec::with_capacity(data.len()), |mut acc, i| {
-        acc.extend(decode_block(graph, replica_id, data, i)?.into_bytes());
-        Ok(acc)
-    })
+    let mut out = vec![0u8; data.len()];
+
+    out.par_chunks_mut(NODE_SIZE)
+        .enumerate()
+        .try_for_each(|(node, chunk)| -> Result<()> {
+            let decoded = decode_block(graph, replica_id, data, node)?;
+            decoded.write_bytes(chunk)?;
+            Ok(())
+        })?;
+
+    Ok(out)
 }
 
 /// Decodes a single node of `data`.
+///
+/// Depends only on the immutable, fully-encoded `data` (never on other decoded nodes), which is what
+/// lets [`decode`] run every node independently/in parallel.
 pub fn decode_block<H, G>(
     graph: &ZigZagGraph<H, G>,
     replica_id: &H::Domain,
@@ -85,18 +102,19 @@ where
     Ok(encode::decode(key, node_data))
 }
 
-/// Creates the encoding key: `Blake2s(replica_id | parent_1 | parent_2 | ...)`.
+/// Creates the encoding key: `SHA256(replica_id | parent_1 | parent_2 | ...)`, reduced to a field
+/// element by clearing the top two bits (the standard LE-254 packing used throughout the codebase).
 ///
-/// Faithful to the 2019 ZigZag KDF (Blake2s, 32-byte output), kept distinct from Stacked's SHA256
-/// labeling.
+/// The KDF hash is SHA256 (rather than the 2019 original's Blake2s) so it can be reproduced
+/// efficiently and reliably in-circuit with `bellperson`'s SHA256 gadget.
 pub fn create_key<H: Hasher>(
     id: &H::Domain,
     node: usize,
     parents: &[u32],
     data: &[u8],
 ) -> Result<H::Domain> {
-    let mut hasher = Blake2s::new().hash_length(NODE_SIZE).to_state();
-    hasher.update(id.into_bytes().as_ref());
+    let mut hasher = Sha256::new();
+    hasher.update(id.into_bytes().as_slice());
 
     // The hash is about the parents, hence skip if a node doesn't have any parents.
     if node != parents[0] as usize {
@@ -117,11 +135,11 @@ pub fn create_key_from_domains<H: Hasher>(
     id: &H::Domain,
     parents_data: &[H::Domain],
 ) -> Result<H::Domain> {
-    let mut hasher = Blake2s::new().hash_length(NODE_SIZE).to_state();
-    hasher.update(id.into_bytes().as_ref());
+    let mut hasher = Sha256::new();
+    hasher.update(id.into_bytes().as_slice());
 
     for parent in parents_data.iter() {
-        hasher.update(parent.into_bytes().as_ref());
+        hasher.update(parent.into_bytes().as_slice());
     }
 
     let hash = hasher.finalize();
@@ -175,5 +193,130 @@ mod tests {
     #[test]
     fn encode_decode_reversed() {
         encode_decode_roundtrip(true);
+    }
+
+    /// ZigZag's defining performance property: extraction is *asymmetric* to replication. Encoding is
+    /// inherently sequential (a node depends on its already-encoded parents), but decoding each node
+    /// depends only on the immutable, fully-encoded replica. This test locks in that independence:
+    /// decoding in forward order, in reverse order, and in parallel must all yield identical results
+    /// (and recover the original data). If a future change made `decode_block` read partially-decoded
+    /// state, the order variants would diverge and this test would fail.
+    #[test]
+    fn decode_is_order_independent_and_parallelizable() {
+        let nodes = 64;
+        let porep_id = [13u8; 32];
+        let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+            None,
+            nodes,
+            BASE_DEGREE,
+            EXP_DEGREE,
+            porep_id,
+            ApiVersion::V1_2_0,
+        )
+        .expect("failed to create graph");
+
+        let replica_id = PoseidonDomain::from([2u8; 32]);
+
+        // Non-trivial, field-valid data so encoding genuinely depends on parent values.
+        let mut original = vec![0u8; nodes * NODE_SIZE];
+        for i in 0..nodes {
+            original[i * NODE_SIZE] = (i as u8).wrapping_mul(7).wrapping_add(3);
+            original[i * NODE_SIZE + 1] = (i as u8).wrapping_mul(31);
+        }
+
+        let mut data = original.clone();
+        encode::<PoseidonHasher, _>(&graph, &replica_id, &mut data).expect("encode failed");
+        assert_ne!(data, original, "encoding did not change data");
+
+        // Decode block-by-block in forward order.
+        let mut forward = vec![0u8; data.len()];
+        for v in 0..nodes {
+            let d = decode_block::<PoseidonHasher, _>(&graph, &replica_id, &data, v)
+                .expect("decode_block failed");
+            d.write_bytes(&mut forward[v * NODE_SIZE..(v + 1) * NODE_SIZE])
+                .expect("write_bytes failed");
+        }
+
+        // Decode block-by-block in reverse order, writing each result into its own position. Because
+        // blocks are independent, this must produce exactly the same output as forward order.
+        let mut reverse = vec![0u8; data.len()];
+        for v in (0..nodes).rev() {
+            let d = decode_block::<PoseidonHasher, _>(&graph, &replica_id, &data, v)
+                .expect("decode_block failed");
+            d.write_bytes(&mut reverse[v * NODE_SIZE..(v + 1) * NODE_SIZE])
+                .expect("write_bytes failed");
+        }
+
+        // The production `decode` path, which decodes all nodes in parallel.
+        let parallel =
+            decode::<PoseidonHasher, _>(&graph, &replica_id, &data).expect("decode failed");
+
+        assert_eq!(
+            forward, original,
+            "forward-order extraction did not recover original data"
+        );
+        assert_eq!(
+            reverse, forward,
+            "reverse-order extraction differs from forward order: decode blocks are not independent"
+        );
+        assert_eq!(
+            parallel, forward,
+            "parallel extraction differs from sequential: decode blocks are not independent"
+        );
+    }
+
+    /// The other half of the asymmetry: encoding *is* order-dependent. On a forward graph every
+    /// node's parents have a lower index, so a correct encoding must proceed low->high (each node
+    /// consumes its already-encoded parents). Encoding high->low instead consumes not-yet-encoded
+    /// parents and therefore yields different bytes. This guards the sequential nature of encoding,
+    /// which is precisely what makes replication slow while extraction stays fast.
+    #[test]
+    fn encoding_is_order_dependent() {
+        let nodes = 64;
+        let porep_id = [17u8; 32];
+        // Forward (non-reversed) graph: parents(v) are all < v.
+        let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+            None,
+            nodes,
+            BASE_DEGREE,
+            EXP_DEGREE,
+            porep_id,
+            ApiVersion::V1_2_0,
+        )
+        .expect("failed to create graph");
+
+        let replica_id = PoseidonDomain::from([9u8; 32]);
+
+        let mut original = vec![0u8; nodes * NODE_SIZE];
+        for i in 0..nodes {
+            original[i * NODE_SIZE] = (i as u8).wrapping_mul(5).wrapping_add(1);
+        }
+
+        // Correct, sequential low->high encoding.
+        let mut correct = original.clone();
+        encode::<PoseidonHasher, _>(&graph, &replica_id, &mut correct).expect("encode failed");
+
+        // Deliberately encode high->low; parents are not yet encoded, so keys differ.
+        let mut wrong = original.clone();
+        let mut parents = vec![0u32; graph.degree()];
+        for v in (0..nodes).rev() {
+            graph.parents(v, &mut parents).expect("parents failed");
+            let key = create_key::<PoseidonHasher>(&replica_id, v, &parents, &wrong)
+                .expect("create_key failed");
+            let start = data_at_node_offset(v);
+            let end = start + NODE_SIZE;
+            let node_data =
+                PoseidonDomain::try_from_bytes(&wrong[start..end]).expect("try_from_bytes failed");
+            let encoded = encode::encode(key, node_data);
+            encoded
+                .write_bytes(&mut wrong[start..end])
+                .expect("write_bytes failed");
+        }
+
+        assert_ne!(
+            correct, wrong,
+            "encoding was order-independent — the sequential dependency (and thus the \
+             replication/extraction asymmetry) has been lost"
+        );
     }
 }

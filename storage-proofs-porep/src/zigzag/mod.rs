@@ -7,6 +7,7 @@
 //! The 2019 reference sources this is ported from are preserved (uncompiled) under
 //! `zigzag-reference/` at the repository root.
 
+pub mod circuit;
 pub(crate) mod vanilla;
 
 pub use vanilla::*;
