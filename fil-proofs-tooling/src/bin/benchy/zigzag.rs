@@ -1,15 +1,18 @@
-use std::io::stdout;
+use std::io::{stdout, Cursor};
 
 use fil_proofs_tooling::shared::{PROVER_ID, TICKET_BYTES};
 use fil_proofs_tooling::{measure, Metadata};
 use filecoin_proofs::constants::ZigZagTree;
-use filecoin_proofs::types::PoRepConfig;
-use filecoin_proofs::{zigzag_pre_commit, zigzag_prove, zigzag_unseal, zigzag_verify_seal};
+use filecoin_proofs::types::{PaddedBytesAmount, PoRepConfig, UnpaddedBytesAmount};
+use filecoin_proofs::{
+    add_piece, zigzag_pre_commit, zigzag_prove, zigzag_unseal, zigzag_verify_seal,
+};
 use log::info;
 use serde::{Deserialize, Serialize};
-use storage_proofs_core::{api_version::ApiVersion, sector::SectorId, util::NODE_SIZE};
+use storage_proofs_core::{api_version::ApiVersion, sector::SectorId};
 
 const SECTOR_ID: u64 = 0;
+const SEED: [u8; 32] = [1u8; 32];
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -62,18 +65,16 @@ pub fn run(sector_size: usize, api_version: ApiVersion, prove: bool) -> anyhow::
     let sector_id = SectorId::from(SECTOR_ID);
     let porep_config = PoRepConfig::new_groth16(sector_size as u64, [0; 32], api_version);
 
-    // Random sector data. ZigZag operates directly on 32-byte field-element nodes, so each node's
-    // most-significant (little-endian) byte is cleared to keep it a canonical BLS12-381 scalar.
-    let mut original = vec![0u8; sector_size];
-    for node in original.chunks_mut(NODE_SIZE) {
-        for b in node.iter_mut() {
-            *b = rand::random::<u8>();
-        }
-        node[NODE_SIZE - 1] = 0;
-    }
+    // Stage a full sector of random user data via the standard piece pipeline (fr32 padding).
+    let unpadded = UnpaddedBytesAmount::from(PaddedBytesAmount(sector_size as u64));
+    let user_bytes: Vec<u8> = (0..usize::from(unpadded))
+        .map(|_| rand::random::<u8>())
+        .collect();
+    let mut original = Vec::new();
+    let (piece_info, _) = add_piece(Cursor::new(&user_bytes), &mut original, unpadded, &[])?;
+    let piece_infos = vec![piece_info];
     let mut data = original.clone();
 
-    // Replicate (encode) in place.
     let replicate = measure(|| {
         zigzag_pre_commit::<ZigZagTree>(
             &porep_config,
@@ -81,17 +82,19 @@ pub fn run(sector_size: usize, api_version: ApiVersion, prove: bool) -> anyhow::
             sector_id,
             TICKET_BYTES,
             &mut data,
+            &piece_infos,
+            None,
         )
     })
     .expect("failed in zigzag_pre_commit");
     let (pre_commit_out, prover_state) = replicate.return_value;
 
-    // Optional SNARK proof + verification.
     let (seal_prove_cpu_time_ms, seal_prove_wall_time_ms, verify_cpu_time_ms, verify_wall_time_ms) =
         if prove {
-            let prove_m =
-                measure(|| zigzag_prove::<ZigZagTree>(&porep_config, prover_state))
-                    .expect("failed in zigzag_prove");
+            let prove_m = measure(|| {
+                zigzag_prove::<ZigZagTree>(&porep_config, prover_state, Some(SEED))
+            })
+            .expect("failed in zigzag_prove");
             let proof = prove_m.return_value.proof;
 
             let verify_m = measure(|| {
@@ -103,6 +106,7 @@ pub fn run(sector_size: usize, api_version: ApiVersion, prove: bool) -> anyhow::
                     PROVER_ID,
                     sector_id,
                     TICKET_BYTES,
+                    Some(SEED),
                     &proof,
                 )
             })
@@ -116,12 +120,10 @@ pub fn run(sector_size: usize, api_version: ApiVersion, prove: bool) -> anyhow::
                 verify_m.wall_time.as_millis() as u64,
             )
         } else {
-            // Drop the prover state (per-layer trees) if we are not proving.
             drop(prover_state);
             (0, 0, 0, 0)
         };
 
-    // Extract (decode) the original data back, in place.
     let extract = measure(|| {
         zigzag_unseal::<ZigZagTree>(
             &porep_config,

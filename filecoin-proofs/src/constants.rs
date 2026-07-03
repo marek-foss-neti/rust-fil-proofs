@@ -170,6 +170,16 @@ pub const MIN_PIECE_SIZE: UnpaddedBytesAmount = UnpaddedBytesAmount(127);
 /// The maximum number of challenges per partition the circuits can work with.
 pub(crate) const MAX_CHALLENGES_PER_PARTITION: u8 = 18;
 
+/// Maximum challenges per partition for ZigZag circuits.
+///
+/// ZigZag's per-challenge cost is dominated by the SHA256 KDF over `degree` parents plus Merkle
+/// openings. Layer-0 data openings use Sha256 (Filecoin CommD), which is ~150× more expensive
+/// per tree level than Poseidon; later layers open against Poseidon replica trees. Empirically
+/// (see `zigzag::circuit::proof` constraint prints), a single challenge on a small sector is on
+/// the order of hundreds of thousands of constraints. Cap at 18 to match Stacked's circuit limit
+/// until a full security-parameter analysis sets ZigZag-specific values.
+pub const ZIGZAG_MAX_CHALLENGES_PER_PARTITION: u8 = MAX_CHALLENGES_PER_PARTITION;
+
 /// The hasher used for creating comm_d.
 pub type DefaultPieceHasher = Sha256Hasher;
 pub type DefaultPieceDomain = <DefaultPieceHasher as Hasher>::Domain;

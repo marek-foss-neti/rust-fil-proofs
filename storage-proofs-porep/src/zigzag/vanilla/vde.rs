@@ -18,6 +18,11 @@ use crate::zigzag::vanilla::graph::ZigZagGraph;
 /// topologically sorted, so a single in-order traversal can encode each node using its
 /// already-encoded parents. The subtlety versus a plain DRG is that a reversed ZigZag layer must be
 /// traversed from high to low node index; this is what `graph.forward()` selects.
+///
+/// **Performance:** encoding is inherently sequential (each node depends on already-encoded
+/// parents). Multicore SDR-style strategies from Stacked do not apply directly; any future
+/// speedup must exploit graph structure (e.g. independent sub-DAGs) rather than a flat parallel
+/// map. Tree building after each layer can use GPU Poseidon builders when enabled.
 pub fn encode<H, G>(
     graph: &ZigZagGraph<H, G>,
     replica_id: &H::Domain,

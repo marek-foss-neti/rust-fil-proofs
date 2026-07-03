@@ -1,11 +1,13 @@
 use std::marker::PhantomData;
+use std::path::Path;
 
 use filecoin_hashers::Hasher;
+use merkletree::store::StoreConfig;
 use serde::{Deserialize, Serialize};
 use storage_proofs_core::{
     drgraph::Graph,
     error::Result,
-    merkle::{create_base_merkle_tree, MerkleProofTrait, MerkleTreeTrait},
+    merkle::{create_base_merkle_tree, BinaryMerkleTree, MerkleProofTrait, MerkleTreeTrait},
     por::DataProof,
     proof::ProofScheme,
     util::NODE_SIZE,
@@ -17,7 +19,7 @@ use crate::{
         challenges::LayerChallenges,
         graph::ZigZagBucketGraph,
         params::{
-            comm_r_star, ChallengeRequirements, LayerTau, PrivateInputs, PublicInputs,
+            comm_r_star, ChallengeRequirements, PrivateInputs, PublicInputs,
             PublicParams, SetupParams, Tau,
         },
         vde,
@@ -26,26 +28,28 @@ use crate::{
 
 /// ZigZag layered DRG PoRep.
 ///
-/// Replicates data through `layers` layers, "zigzagging" (reversing) the graph between each layer.
-/// Every layer's encoding is committed to with its own Merkle tree (of the caller-chosen `Tree`
-/// type), and the per-layer replica roots are folded into a single `comm_r_star`.
+/// `Tree` is the Poseidon replica-tree shape. `G` is the piece/data hasher (Sha256) used for the
+/// layer-0 data tree so `comm_d` matches Filecoin's standard piece-aggregated CommD.
 #[derive(Debug)]
-pub struct ZigZagDrgPoRep<Tree>
+pub struct ZigZagDrgPoRep<Tree, G>
 where
     Tree: MerkleTreeTrait,
+    G: Hasher,
 {
     _tree: PhantomData<Tree>,
+    _g: PhantomData<G>,
 }
 
-/// The DrgPoRep-style proof for a single ZigZag layer: for each challenged node, an inclusion proof
-/// of the encoded node and its parents in the layer's replica tree, plus an inclusion proof of the
-/// pre-encoding ("data") node in the previous layer's tree.
+/// Per-layer proof: replica-node and parent inclusions in the Poseidon replica tree, plus (for
+/// layers > 0) data-node inclusions in the previous layer's replica tree.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LayerProof<Tree: MerkleTreeTrait> {
     #[serde(bound = "")]
     pub replica_nodes: Vec<DataProof<Tree::Proof>>,
     #[serde(bound = "")]
     pub replica_parents: Vec<Vec<(u32, DataProof<Tree::Proof>)>>,
+    /// Data-node proofs against the previous layer's Poseidon replica tree. Empty for layer 0
+    /// (those live in [`Proof::layer0_data_nodes`] against the Sha256 `comm_d` tree).
     #[serde(bound = "")]
     pub nodes: Vec<DataProof<Tree::Proof>>,
 }
@@ -60,99 +64,107 @@ impl<Tree: MerkleTreeTrait> Clone for LayerProof<Tree> {
     }
 }
 
-/// A full ZigZag proof: one `LayerProof` per layer, plus the per-layer taus.
+/// Full vanilla proof across all layers.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Proof<Tree: MerkleTreeTrait> {
+pub struct Proof<Tree: MerkleTreeTrait, G: 'static + Hasher> {
     #[serde(bound = "")]
     pub encoding_proofs: Vec<LayerProof<Tree>>,
+    /// Layer-0 data-node inclusion proofs against the Sha256 `comm_d` tree.
     #[serde(bound = "")]
-    pub tau: Vec<LayerTau<<Tree::Hasher as Hasher>::Domain>>,
+    pub layer0_data_nodes:
+        Vec<DataProof<<BinaryMerkleTree<G> as MerkleTreeTrait>::Proof>>,
+    #[serde(bound = "")]
+    pub layer_comm_rs: Vec<<Tree::Hasher as Hasher>::Domain>,
+    #[serde(bound = "")]
+    pub comm_d: G::Domain,
 }
 
-impl<Tree: MerkleTreeTrait> Clone for Proof<Tree> {
+impl<Tree: MerkleTreeTrait, G: 'static + Hasher> Clone for Proof<Tree, G> {
     fn clone(&self) -> Self {
         Proof {
             encoding_proofs: self.encoding_proofs.clone(),
-            tau: self.tau.clone(),
+            layer0_data_nodes: self.layer0_data_nodes.clone(),
+            layer_comm_rs: self.layer_comm_rs.clone(),
+            comm_d: self.comm_d,
         }
     }
 }
 
-impl<Tree> ZigZagDrgPoRep<Tree>
+impl<Tree, G> ZigZagDrgPoRep<Tree, G>
 where
     Tree: 'static + MerkleTreeTrait,
+    G: 'static + Hasher,
 {
-    /// Transform a layer's graph into the next layer's graph. For ZigZag this simply toggles the
-    /// graph's direction (the expensive work happens lazily when parents are computed).
-    pub fn transform(graph: &ZigZagBucketGraph<Tree::Hasher>) -> ZigZagBucketGraph<Tree::Hasher> {
-        graph.zigzag()
-    }
-
-    /// Transform a layer's graph into the previous layer's graph. Because `transform` is an
-    /// involution for ZigZag, the inverse is the same toggle.
-    pub fn invert_transform(
+    pub fn transform(
         graph: &ZigZagBucketGraph<Tree::Hasher>,
     ) -> ZigZagBucketGraph<Tree::Hasher> {
         graph.zigzag()
     }
 
-    /// Encode `data` in place through all layers, returning the per-layer taus (with `comm_r_star`)
-    /// and the per-layer replica Merkle trees.
+    pub fn invert_transform(
+        graph: &ZigZagBucketGraph<Tree::Hasher>,
+    ) -> ZigZagBucketGraph<Tree::Hasher> {
+        // Zigzag is an involution.
+        graph.zigzag()
+    }
+
+    /// Replicate `data` in place through `layers` ZigZag layers.
+    ///
+    /// Returns the commitments, the Sha256 data tree (`comm_d`), and one Poseidon replica tree per
+    /// layer. When `cache_path` is `Some`, trees are persisted via `StoreConfig` (disk-backed
+    /// stores) under that directory, so peak RAM is dominated by the sector buffer rather than
+    /// fully-materialized in-memory trees.
     pub fn transform_and_replicate_layers(
         graph: &ZigZagBucketGraph<Tree::Hasher>,
         layer_challenges: &LayerChallenges,
         replica_id: &<Tree::Hasher as Hasher>::Domain,
         data: &mut [u8],
-    ) -> Result<(Tau<<Tree::Hasher as Hasher>::Domain>, Vec<Tree>)> {
+        cache_path: Option<&Path>,
+    ) -> Result<(
+        Tau<<Tree::Hasher as Hasher>::Domain, G::Domain>,
+        BinaryMerkleTree<G>,
+        Vec<Tree>,
+    )> {
         let layers = layer_challenges.layers();
         assert!(layers > 0);
         assert_eq!(data.len() % NODE_SIZE, 0);
 
         let leaves = data.len() / NODE_SIZE;
 
-        let mut trees: Vec<Tree> = Vec::with_capacity(layers + 1);
+        let tree_d_config = cache_path.map(|p| StoreConfig::new(p, "zigzag-tree-d", 0));
+        // Layer 0: Sha256 Merkle tree over the original (fr32-padded) data — this is Filecoin CommD.
+        let tree_d =
+            create_base_merkle_tree::<BinaryMerkleTree<G>>(tree_d_config, leaves, data)?;
+        let comm_d = tree_d.root();
+
+        let mut replica_trees: Vec<Tree> = Vec::with_capacity(layers);
+        let mut layer_comm_rs = Vec::with_capacity(layers);
         let mut current_graph = graph.clone();
 
-        // Layer 0: the Merkle tree over the original (unencoded) data.
-        trees.push(create_base_merkle_tree::<Tree>(None, leaves, data)?);
-
-        for _layer in 0..layers {
-            // Encode this layer in place using the current (possibly reversed) graph.
+        for layer in 0..layers {
             vde::encode(&current_graph, replica_id, data)?;
-
-            // Commit to the freshly-encoded layer.
-            trees.push(create_base_merkle_tree::<Tree>(None, leaves, data)?);
-
-            // Prepare the next layer's graph.
+            let tree_r_config =
+                cache_path.map(|p| StoreConfig::new(p, format!("zigzag-tree-r-{layer}"), 0));
+            let tree_r = create_base_merkle_tree::<Tree>(tree_r_config, leaves, data)?;
+            layer_comm_rs.push(tree_r.root());
+            replica_trees.push(tree_r);
             current_graph = Self::transform(&current_graph);
         }
 
-        // Build the per-layer taus: layer `i`'s comm_d is tree `i`'s root, comm_r is tree `i+1`'s root.
-        let mut layer_taus = Vec::with_capacity(layers);
-        let mut comm_rs = Vec::with_capacity(layers);
-        for i in 0..layers {
-            let comm_d = trees[i].root();
-            let comm_r = trees[i + 1].root();
-            layer_taus.push(LayerTau::new(comm_d, comm_r));
-            comm_rs.push(comm_r);
-        }
-
-        let comm_r_star = comm_r_star::<Tree::Hasher>(replica_id, &comm_rs)?;
+        let comm_r_star_val = comm_r_star::<Tree::Hasher>(replica_id, &layer_comm_rs)?;
 
         Ok((
             Tau {
-                layer_taus,
-                comm_r_star,
+                comm_d,
+                layer_comm_rs,
+                comm_r_star: comm_r_star_val,
             },
-            trees,
+            tree_d,
+            replica_trees,
         ))
     }
 
     /// Invert the replication, recovering the original data in place.
-    ///
-    /// ZigZag decoding proceeds from the last layer back to the first. Because each layer's graph is
-    /// the reverse of the previous, we start from the final layer's graph and toggle back on each
-    /// step, decoding with the same graph direction that encoded that layer.
     pub fn extract_and_invert_transform_layers(
         graph: &ZigZagBucketGraph<Tree::Hasher>,
         layer_challenges: &LayerChallenges,
@@ -162,13 +174,11 @@ where
         let layers = layer_challenges.layers();
         assert!(layers > 0);
 
-        // Reconstruct the graph used by the final layer: `layers - 1` toggles from the base graph.
         let mut layer_graph = graph.clone();
         for _ in 0..(layers - 1) {
             layer_graph = Self::transform(&layer_graph);
         }
 
-        // Decode from the last layer back to the first.
         for _ in 0..layers {
             let decoded = vde::decode(&layer_graph, replica_id, data)?;
             data.copy_from_slice(&decoded);
@@ -193,15 +203,16 @@ pub fn setup<Tree: MerkleTreeTrait>(sp: &SetupParams) -> Result<PublicParams<Tre
     Ok(PublicParams::new(graph, sp.layer_challenges.clone()))
 }
 
-impl<'a, Tree> ProofScheme<'a> for ZigZagDrgPoRep<Tree>
+impl<'a, Tree, G> ProofScheme<'a> for ZigZagDrgPoRep<Tree, G>
 where
     Tree: 'static + MerkleTreeTrait,
+    G: 'static + Hasher,
 {
     type PublicParams = PublicParams<Tree>;
     type SetupParams = SetupParams;
-    type PublicInputs = PublicInputs<<Tree::Hasher as Hasher>::Domain>;
-    type PrivateInputs = PrivateInputs<Tree>;
-    type Proof = Proof<Tree>;
+    type PublicInputs = PublicInputs<<Tree::Hasher as Hasher>::Domain, G::Domain>;
+    type PrivateInputs = PrivateInputs<Tree, G>;
+    type Proof = Proof<Tree, G>;
     type Requirements = ChallengeRequirements;
 
     fn setup(sp: &Self::SetupParams) -> Result<Self::PublicParams> {
@@ -226,15 +237,16 @@ where
         assert!(partition_count > 0);
 
         let layers = pub_params.layer_challenges.layers();
+        assert_eq!(priv_inputs.aux.len(), layers);
 
         (0..partition_count)
             .map(|k| {
                 let mut encoding_proofs = Vec::with_capacity(layers);
+                let mut layer0_data_nodes = Vec::new();
                 let mut layer_graph = pub_params.graph.clone();
 
                 for layer in 0..layers {
-                    let tree_d = &priv_inputs.aux[layer];
-                    let tree_r = &priv_inputs.aux[layer + 1];
+                    let tree_r = &priv_inputs.aux[layer];
                     let graph_size = layer_graph.size();
                     let degree = layer_graph.degree();
 
@@ -270,12 +282,23 @@ where
                         }
                         replica_parents.push(parent_proofs);
 
-                        let data_proof = tree_d.gen_proof(challenge)?;
-                        let data = data_proof.leaf();
-                        nodes.push(DataProof {
-                            data,
-                            proof: data_proof,
-                        });
+                        if layer == 0 {
+                            let data_proof = priv_inputs.tree_d.gen_proof(challenge)?;
+                            let data = data_proof.leaf();
+                            layer0_data_nodes.push(DataProof {
+                                data,
+                                proof: data_proof,
+                            });
+                        } else {
+                            // Data for layer i is the previous layer's replica.
+                            let tree_d = &priv_inputs.aux[layer - 1];
+                            let data_proof = tree_d.gen_proof(challenge)?;
+                            let data = data_proof.leaf();
+                            nodes.push(DataProof {
+                                data,
+                                proof: data_proof,
+                            });
+                        }
                     }
 
                     encoding_proofs.push(LayerProof {
@@ -289,7 +312,9 @@ where
 
                 Ok(Proof {
                     encoding_proofs,
-                    tau: priv_inputs.tau.clone(),
+                    layer0_data_nodes,
+                    layer_comm_rs: priv_inputs.layer_comm_rs.clone(),
+                    comm_d: priv_inputs.comm_d,
                 })
             })
             .collect()
@@ -306,7 +331,19 @@ where
         if proof.encoding_proofs.len() != layers {
             return Ok(false);
         }
-        if proof.tau.len() != layers {
+        if proof.layer_comm_rs.len() != layers {
+            return Ok(false);
+        }
+
+        let tau = match &pub_inputs.tau {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+
+        if proof.comm_d != tau.comm_d {
+            return Ok(false);
+        }
+        if proof.layer_comm_rs[layers - 1] != tau.comm_r {
             return Ok(false);
         }
 
@@ -314,7 +351,7 @@ where
 
         for layer in 0..layers {
             let layer_proof = &proof.encoding_proofs[layer];
-            let tau = &proof.tau[layer];
+            let comm_r = proof.layer_comm_rs[layer];
             let graph_size = layer_graph.size();
             let degree = layer_graph.degree();
 
@@ -327,8 +364,15 @@ where
 
             if layer_proof.replica_nodes.len() != challenges.len()
                 || layer_proof.replica_parents.len() != challenges.len()
-                || layer_proof.nodes.len() != challenges.len()
             {
+                return Ok(false);
+            }
+
+            if layer == 0 {
+                if proof.layer0_data_nodes.len() != challenges.len() {
+                    return Ok(false);
+                }
+            } else if layer_proof.nodes.len() != challenges.len() {
                 return Ok(false);
             }
 
@@ -341,19 +385,34 @@ where
 
                 let replica_node = &layer_proof.replica_nodes[i];
                 let parents = &layer_proof.replica_parents[i];
-                let data_node = &layer_proof.nodes[i];
 
-                // Merkle inclusion: encoded node and data node against their respective roots.
-                if !replica_node.proof.validate(challenge)
-                    || replica_node.proof.root() != tau.comm_r
+                if !replica_node.proof.validate(challenge) || replica_node.proof.root() != comm_r
                 {
                     return Ok(false);
                 }
-                if !data_node.proof.validate(challenge) || data_node.proof.root() != tau.comm_d {
-                    return Ok(false);
-                }
 
-                // Parents must match the graph and be included in the replica tree.
+                // Data-node inclusion: Sha256 comm_d for layer 0, previous replica root otherwise.
+                let data_leaf = if layer == 0 {
+                    let data_node = &proof.layer0_data_nodes[i];
+                    if !data_node.proof.validate(challenge)
+                        || data_node.proof.root() != proof.comm_d
+                    {
+                        return Ok(false);
+                    }
+                    // Domain types differ (G vs Tree::Hasher); compare via field elements.
+                    let data_fr: blstrs::Scalar = data_node.data.into();
+                    data_fr
+                } else {
+                    let data_node = &layer_proof.nodes[i];
+                    let expected_comm_d = proof.layer_comm_rs[layer - 1];
+                    if !data_node.proof.validate(challenge)
+                        || data_node.proof.root() != expected_comm_d
+                    {
+                        return Ok(false);
+                    }
+                    data_node.data.into()
+                };
+
                 layer_graph.parents(challenge, &mut expected_parents)?;
                 if parents.len() != expected_parents.len() {
                     return Ok(false);
@@ -363,21 +422,20 @@ where
                         return Ok(false);
                     }
                     if !parent_proof.proof.validate(*parent as usize)
-                        || parent_proof.proof.root() != tau.comm_r
+                        || parent_proof.proof.root() != comm_r
                     {
                         return Ok(false);
                     }
                 }
 
-                // Encoding relation: decode(replica_node) with the KDF-derived key must equal the
-                // data node.
                 let parent_data: Vec<_> = parents.iter().map(|(_, p)| p.data).collect();
                 let key = vde::create_key_from_domains::<Tree::Hasher>(
                     &pub_inputs.replica_id,
                     &parent_data,
                 )?;
                 let unsealed = encode::decode(key, replica_node.data);
-                if unsealed != data_node.data {
+                let unsealed_fr: blstrs::Scalar = unsealed.into();
+                if unsealed_fr != data_leaf {
                     return Ok(false);
                 }
             }
@@ -407,7 +465,10 @@ where
 mod tests {
     use super::*;
 
-    use filecoin_hashers::poseidon::{PoseidonDomain, PoseidonHasher};
+    use filecoin_hashers::{
+        poseidon::{PoseidonDomain, PoseidonHasher},
+        sha256::Sha256Hasher,
+    };
     use generic_array::typenum::{U0, U2};
     use storage_proofs_core::{
         api_version::ApiVersion,
@@ -415,12 +476,10 @@ mod tests {
         merkle::{DiskStore, MerkleTreeWrapper},
     };
 
-    use crate::zigzag::vanilla::{
-        graph::EXP_DEGREE,
-        params::SetupParams,
-    };
+    use crate::zigzag::vanilla::graph::EXP_DEGREE;
 
     type ZZTree = MerkleTreeWrapper<PoseidonHasher, DiskStore<PoseidonDomain>, U2, U0, U0>;
+    type Piece = Sha256Hasher;
 
     fn replicate_extract_roundtrip(layers: usize) {
         let nodes = 128;
@@ -441,28 +500,28 @@ mod tests {
         let original = vec![0u8; nodes * NODE_SIZE];
         let mut data = original.clone();
 
-        let (tau, trees) =
-            ZigZagDrgPoRep::<ZZTree>::transform_and_replicate_layers(
+        let (tau, tree_d, replica_trees) =
+            ZigZagDrgPoRep::<ZZTree, Piece>::transform_and_replicate_layers(
                 &pp.graph,
                 &pp.layer_challenges,
                 &replica_id,
                 &mut data,
+                None,
             )
             .expect("replication failed");
 
         assert_ne!(data, original, "replication did not change data");
-        assert_eq!(tau.layer_taus.len(), layers);
-        assert_eq!(trees.len(), layers + 1);
+        assert_eq!(tau.layer_comm_rs.len(), layers);
+        assert_eq!(replica_trees.len(), layers);
 
-        // comm_d of layer 0 must be the root of the tree over the original data.
-        let original_tree = create_base_merkle_tree::<ZZTree>(None, nodes, &original)
-            .expect("failed to build original tree");
-        assert_eq!(tau.layer_taus[0].comm_d, original_tree.root());
+        let original_tree =
+            create_base_merkle_tree::<BinaryMerkleTree<Piece>>(None, nodes, &original)
+                .expect("failed to build original tree");
+        assert_eq!(tau.comm_d, original_tree.root());
+        assert_eq!(tau.comm_d, tree_d.root());
+        assert_eq!(tau.simplify().comm_r, replica_trees[layers - 1].root());
 
-        // The final replica commitment must match the last tree's root.
-        assert_eq!(tau.simplify().comm_r, trees[layers].root());
-
-        ZigZagDrgPoRep::<ZZTree>::extract_and_invert_transform_layers(
+        ZigZagDrgPoRep::<ZZTree, Piece>::extract_and_invert_transform_layers(
             &pp.graph,
             &pp.layer_challenges,
             &replica_id,
@@ -484,10 +543,6 @@ mod tests {
     }
 
     fn prove_verify(layers: usize, challenge_count: usize) {
-        use storage_proofs_core::proof::ProofScheme;
-
-        use crate::zigzag::vanilla::params::{comm_r_star, PrivateInputs, PublicInputs};
-
         let nodes = 128;
         let porep_id = [11u8; 32];
 
@@ -500,20 +555,22 @@ mod tests {
             layer_challenges: LayerChallenges::new_fixed(layers, challenge_count),
         };
 
-        let pp = ZigZagDrgPoRep::<ZZTree>::setup(&sp).expect("setup failed");
+        let pp = ZigZagDrgPoRep::<ZZTree, Piece>::setup(&sp).expect("setup failed");
 
         let replica_id = PoseidonDomain::default();
         let mut data = vec![0u8; nodes * NODE_SIZE];
 
-        let (tau, trees) = ZigZagDrgPoRep::<ZZTree>::transform_and_replicate_layers(
-            &pp.graph,
-            &pp.layer_challenges,
-            &replica_id,
-            &mut data,
-        )
-        .expect("replication failed");
+        let (tau, tree_d, replica_trees) =
+            ZigZagDrgPoRep::<ZZTree, Piece>::transform_and_replicate_layers(
+                &pp.graph,
+                &pp.layer_challenges,
+                &replica_id,
+                &mut data,
+                None,
+            )
+            .expect("replication failed");
 
-        let pub_inputs = PublicInputs::<PoseidonDomain> {
+        let pub_inputs = PublicInputs {
             replica_id,
             seed: None,
             tau: Some(tau.simplify()),
@@ -521,31 +578,29 @@ mod tests {
             k: None,
         };
 
-        let priv_inputs = PrivateInputs::<ZZTree> {
-            aux: trees,
-            tau: tau.layer_taus.clone(),
+        let priv_inputs = PrivateInputs::<ZZTree, Piece> {
+            tree_d,
+            aux: replica_trees,
+            layer_comm_rs: tau.layer_comm_rs.clone(),
+            comm_d: tau.comm_d,
         };
 
-        let proof = ZigZagDrgPoRep::<ZZTree>::prove(&pp, &pub_inputs, &priv_inputs)
+        let proof = ZigZagDrgPoRep::<ZZTree, Piece>::prove(&pp, &pub_inputs, &priv_inputs)
             .expect("prove failed");
 
         assert!(
-            ZigZagDrgPoRep::<ZZTree>::verify(&pp, &pub_inputs, &proof).expect("verify errored"),
+            ZigZagDrgPoRep::<ZZTree, Piece>::verify(&pp, &pub_inputs, &proof)
+                .expect("verify errored"),
             "valid proof did not verify"
         );
 
-        // Tampering with the replica id must make verification fail.
         let mut bad_inputs = pub_inputs.clone();
-        let mut wrong_comm_rs = Vec::new();
-        for lt in &tau.layer_taus {
-            wrong_comm_rs.push(lt.comm_r);
-        }
         bad_inputs.replica_id = PoseidonDomain::from([3u8; 32]);
         bad_inputs.comm_r_star =
-            comm_r_star::<PoseidonHasher>(&bad_inputs.replica_id, &wrong_comm_rs)
+            comm_r_star::<PoseidonHasher>(&bad_inputs.replica_id, &tau.layer_comm_rs)
                 .expect("comm_r_star failed");
         assert!(
-            !ZigZagDrgPoRep::<ZZTree>::verify(&pp, &bad_inputs, &proof)
+            !ZigZagDrgPoRep::<ZZTree, Piece>::verify(&pp, &bad_inputs, &proof)
                 .expect("verify errored"),
             "proof verified under the wrong replica id"
         );

@@ -13,6 +13,7 @@ use storage_proofs_core::{
 };
 use storage_proofs_porep::stacked::{StackedCompound, StackedDrg};
 use storage_proofs_porep::zigzag::{circuit::ZigZagCompound, ZigZagDrgPoRep};
+// DefaultPieceHasher is the Sha256 data-tree hasher for ZigZag CommD.
 use storage_proofs_post::fallback::{FallbackPoSt, FallbackPoStCircuit, FallbackPoStCompound};
 use storage_proofs_update::{
     circuit::EmptySectorUpdateCircuit, compound::EmptySectorUpdateCompound, constants::TreeRHasher,
@@ -223,10 +224,10 @@ pub(crate) fn get_zigzag_params<Tree: 'static + MerkleTreeTrait>(
     let public_params = zigzag_public_params::<Tree>(porep_config)?;
 
     let parameters_generator = || {
-        <ZigZagCompound<Tree> as CompoundProof<ZigZagDrgPoRep<Tree>, _>>::groth_params::<OsRng>(
-            None,
-            &public_params,
-        )
+        <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
+            ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
+            _,
+        >>::groth_params::<OsRng>(None, &public_params)
     };
 
     lookup_groth_params(
@@ -333,9 +334,10 @@ pub(crate) fn get_zigzag_verifying_key<Tree: 'static + MerkleTreeTrait>(
     let public_params = zigzag_public_params::<Tree>(porep_config)?;
 
     let vk_generator = || {
-        let vk = <ZigZagCompound<Tree> as CompoundProof<ZigZagDrgPoRep<Tree>, _>>::verifying_key::<
-            OsRng,
-        >(None, &public_params)?;
+        let vk = <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
+            ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
+            _,
+        >>::verifying_key::<OsRng>(None, &public_params)?;
         Ok(prepare_verifying_key(&vk))
     };
 

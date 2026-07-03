@@ -1,8 +1,11 @@
 use filecoin_hashers::{Domain, HashFunction, Hasher};
 use serde::{Deserialize, Serialize};
 use storage_proofs_core::{
-    api_version::ApiVersion, error::Result, merkle::MerkleTreeTrait,
-    parameter_cache::ParameterSetMetadata, PoRepID,
+    api_version::ApiVersion,
+    error::Result,
+    merkle::{BinaryMerkleTree, MerkleTreeTrait},
+    parameter_cache::ParameterSetMetadata,
+    PoRepID,
 };
 
 use crate::zigzag::vanilla::{
@@ -21,7 +24,10 @@ pub struct SetupParams {
     pub layer_challenges: LayerChallenges,
 }
 
-/// Public parameters for a ZigZag layered PoRep, over a Poseidon Merkle tree of type `Tree`.
+/// Public parameters for a ZigZag layered PoRep.
+///
+/// `Tree` is the Poseidon replica-tree shape; `G` is the piece/data hasher (Sha256) used for
+/// `comm_d` so it matches Filecoin's standard piece-aggregated CommD.
 pub struct PublicParams<Tree>
 where
     Tree: MerkleTreeTrait,
@@ -52,10 +58,7 @@ impl<Tree> PublicParams<Tree>
 where
     Tree: MerkleTreeTrait,
 {
-    pub fn new(
-        graph: ZigZagBucketGraph<Tree::Hasher>,
-        layer_challenges: LayerChallenges,
-    ) -> Self {
+    pub fn new(graph: ZigZagBucketGraph<Tree::Hasher>, layer_challenges: LayerChallenges) -> Self {
         PublicParams {
             graph,
             layer_challenges,
@@ -81,54 +84,59 @@ where
     }
 }
 
-/// A single layer's data and replica commitments (`comm_d` = input tree root, `comm_r` = encoded
-/// tree root). Equivalent to the 2019 `porep::Tau`, which no longer exists in the core crate.
+/// Public commitments: Sha256 `comm_d` (piece/data tree) and Poseidon `comm_r` (final replica).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LayerTau<D: Domain> {
+pub struct LayerTau<R: Domain, D: Domain> {
     #[serde(bound = "")]
     pub comm_d: D,
     #[serde(bound = "")]
-    pub comm_r: D,
+    pub comm_r: R,
 }
 
-impl<D: Domain> LayerTau<D> {
-    pub fn new(comm_d: D, comm_r: D) -> Self {
+impl<R: Domain, D: Domain> LayerTau<R, D> {
+    pub fn new(comm_d: D, comm_r: R) -> Self {
         LayerTau { comm_d, comm_r }
     }
 }
 
-/// The per-layer commitments produced during replication, plus the aggregate `comm_r_star`.
+/// Commitments produced during replication.
+///
+/// `comm_d` is the Sha256 root of the original (fr32-padded) data. `layer_comm_rs` holds the
+/// Poseidon root of each layer's replica tree. `comm_r_star` folds `replica_id` with every
+/// per-layer replica root.
 #[derive(Debug, Clone)]
-pub struct Tau<D: Domain> {
-    pub layer_taus: Vec<LayerTau<D>>,
-    pub comm_r_star: D,
+pub struct Tau<R: Domain, D: Domain> {
+    pub comm_d: D,
+    pub layer_comm_rs: Vec<R>,
+    pub comm_r_star: R,
 }
 
-impl<D: Domain> Tau<D> {
-    /// Collapse the per-layer taus into a single `LayerTau` using the original data commitment
-    /// (`comm_d` of the first layer) and the final replica commitment (`comm_r` of the last layer).
-    pub fn simplify(&self) -> LayerTau<D> {
+impl<R: Domain, D: Domain> Tau<R, D> {
+    /// Collapse into the public `(comm_d, comm_r)` pair used as circuit inputs.
+    pub fn simplify(&self) -> LayerTau<R, D> {
         LayerTau {
-            comm_r: self.layer_taus[self.layer_taus.len() - 1].comm_r,
-            comm_d: self.layer_taus[0].comm_d,
+            comm_d: self.comm_d,
+            comm_r: self.layer_comm_rs[self.layer_comm_rs.len() - 1],
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PublicInputs<D: Domain> {
+pub struct PublicInputs<R: Domain, D: Domain> {
     #[serde(bound = "")]
-    pub replica_id: D,
+    pub replica_id: R,
+    /// Chain-provided challenge seed (ticket). When `None`, challenges derive from `comm_r_star`
+    /// (non-interactive / legacy behaviour).
     #[serde(bound = "")]
-    pub seed: Option<D>,
+    pub seed: Option<R>,
     #[serde(bound = "")]
-    pub tau: Option<LayerTau<D>>,
+    pub tau: Option<LayerTau<R, D>>,
     #[serde(bound = "")]
-    pub comm_r_star: D,
+    pub comm_r_star: R,
     pub k: Option<usize>,
 }
 
-impl<D: Domain> PublicInputs<D> {
+impl<R: Domain, D: Domain> PublicInputs<R, D> {
     pub fn challenges(
         &self,
         layer_challenges: &LayerChallenges,
@@ -137,7 +145,7 @@ impl<D: Domain> PublicInputs<D> {
         partition_k: Option<usize>,
     ) -> Vec<usize> {
         let commitment = self.seed.as_ref().unwrap_or(&self.comm_r_star);
-        derive_challenges::<D>(
+        derive_challenges::<R>(
             layer_challenges,
             layer,
             leaves,
@@ -148,13 +156,19 @@ impl<D: Domain> PublicInputs<D> {
     }
 }
 
-/// Private inputs for proving: the per-layer replica trees and their taus.
-pub struct PrivateInputs<Tree>
+/// Private inputs for proving.
+///
+/// `tree_d` is the Sha256 binary Merkle tree over the original data (`comm_d`). `aux` holds one
+/// Poseidon replica tree per layer.
+pub struct PrivateInputs<Tree, G>
 where
     Tree: MerkleTreeTrait,
+    G: 'static + Hasher,
 {
+    pub tree_d: BinaryMerkleTree<G>,
     pub aux: Vec<Tree>,
-    pub tau: Vec<LayerTau<<Tree::Hasher as Hasher>::Domain>>,
+    pub layer_comm_rs: Vec<<Tree::Hasher as Hasher>::Domain>,
+    pub comm_d: G::Domain,
 }
 
 /// The ZigZag challenge requirement: at least `minimum_challenges` across all partitions.

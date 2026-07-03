@@ -2,6 +2,7 @@ use anyhow::{ensure, Result};
 use storage_proofs_core::{api_version::ApiFeature, proof::ProofScheme};
 use storage_proofs_porep::stacked::{self, Challenges, StackedDrg};
 use storage_proofs_porep::zigzag::{self, LayerChallenges, ZigZagDrgPoRep};
+// DefaultPieceHasher is used as the Sha256 data-tree hasher for ZigZag CommD.
 use storage_proofs_post::fallback::{self, FallbackPoSt};
 
 use crate::{
@@ -109,7 +110,7 @@ pub fn setup_params(porep_config: &PoRepConfig) -> Result<stacked::SetupParams> 
 pub fn zigzag_public_params<Tree: 'static + MerkleTreeTrait>(
     porep_config: &PoRepConfig,
 ) -> Result<zigzag::PublicParams<Tree>> {
-    ZigZagDrgPoRep::<Tree>::setup(&zigzag_setup_params(porep_config)?)
+    ZigZagDrgPoRep::<Tree, DefaultPieceHasher>::setup(&zigzag_setup_params(porep_config)?)
 }
 
 /// ZigZag layered PoRep setup parameters, derived from the porep config.
@@ -138,10 +139,10 @@ pub fn zigzag_setup_params(porep_config: &PoRepConfig) -> Result<zigzag::SetupPa
         usize::from(porep_config.partitions),
     );
     ensure!(
-        challenges_per_layer <= usize::from(MAX_CHALLENGES_PER_PARTITION),
-        "challenges per layer ({}) exceeds the circuit maximum ({})",
+        challenges_per_layer <= usize::from(crate::constants::ZIGZAG_MAX_CHALLENGES_PER_PARTITION),
+        "challenges per layer ({}) exceeds the ZigZag circuit maximum ({})",
         challenges_per_layer,
-        MAX_CHALLENGES_PER_PARTITION,
+        crate::constants::ZIGZAG_MAX_CHALLENGES_PER_PARTITION,
     );
 
     Ok(zigzag::SetupParams {

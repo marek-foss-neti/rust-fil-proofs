@@ -25,6 +25,7 @@ use storage_proofs_core::{
 };
 use storage_proofs_porep::stacked::{StackedCircuit, StackedCompound, StackedDrg};
 use storage_proofs_porep::zigzag::{circuit::ZigZagCompound, ZigZagDrgPoRep};
+// DefaultPieceHasher is the Sha256 data-tree hasher for ZigZag CommD.
 use storage_proofs_post::fallback::{FallbackPoSt, FallbackPoStCircuit, FallbackPoStCompound};
 use storage_proofs_update::constants::TreeRHasher;
 use storage_proofs_update::{
@@ -71,19 +72,30 @@ fn cache_zigzag_params<Tree: 'static + MerkleTreeTrait>(porep_config: PoRepConfi
     let public_params = zigzag_public_params::<Tree>(&porep_config)
         .expect("failed to get zigzag public params from config");
 
-    let circuit = <ZigZagCompound<Tree> as CompoundProof<ZigZagDrgPoRep<Tree>, _>>::blank_circuit(
+    let circuit = <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
+        ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
+        _,
+    >>::blank_circuit(&public_params);
+
+    let _ = ZigZagCompound::<Tree, DefaultPieceHasher>::get_param_metadata(
+        circuit.clone(),
         &public_params,
-    );
+    )
+    .expect("failed to get metadata");
 
-    let _ = ZigZagCompound::<Tree>::get_param_metadata(circuit.clone(), &public_params)
-        .expect("failed to get metadata");
+    let _ = ZigZagCompound::<Tree, DefaultPieceHasher>::get_groth_params(
+        Some(&mut OsRng),
+        circuit.clone(),
+        &public_params,
+    )
+    .expect("failed to get groth params");
 
-    let _ =
-        ZigZagCompound::<Tree>::get_groth_params(Some(&mut OsRng), circuit.clone(), &public_params)
-            .expect("failed to get groth params");
-
-    let _ = ZigZagCompound::<Tree>::get_verifying_key(Some(&mut OsRng), circuit, &public_params)
-        .expect("failed to get verifying key");
+    let _ = ZigZagCompound::<Tree, DefaultPieceHasher>::get_verifying_key(
+        Some(&mut OsRng),
+        circuit,
+        &public_params,
+    )
+    .expect("failed to get verifying key");
 }
 
 fn cache_winning_post_params<Tree: 'static + MerkleTreeTrait>(post_config: &PoStConfig) {
