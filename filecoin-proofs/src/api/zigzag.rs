@@ -22,10 +22,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{ensure, Context, Result};
 use filecoin_hashers::Hasher;
 use fr32::write_unpadded;
+use merkletree::{merkle::MerkleTree, store::StoreConfig};
 use serde::{Deserialize, Serialize};
 use storage_proofs_core::{
     compound_proof::{self, CompoundProof},
-    merkle::{create_base_merkle_tree, BinaryMerkleTree, MerkleTreeTrait},
+    drgraph::Graph,
+    merkle::{create_base_merkle_tree, BinaryMerkleTree, MerkleTreeTrait, Store},
     multi_proof::MultiProof,
     sector::SectorId,
     util::NODE_SIZE,
@@ -33,13 +35,14 @@ use storage_proofs_core::{
 use storage_proofs_porep::{
     stacked::generate_replica_id,
     zigzag::{
-        circuit::ZigZagCompound, ChallengeRequirements, LayerTau, PrivateInputs, PublicInputs, Tau,
-        ZigZagDrgPoRep,
+        circuit::ZigZagCompound, comm_r_star, ChallengeRequirements, LayerTau, PrivateInputs,
+        PublicInputs, Tau, ZigZagDrgPoRep,
     },
 };
 
 use crate::{
     api::{as_safe_commitment, commitment_from_fr},
+    api::{get_base_tree_leafs, get_base_tree_size},
     caches::{get_zigzag_params, get_zigzag_verifying_key},
     constants::{DefaultPieceDomain, DefaultPieceHasher},
     parameters::{zigzag_public_params, zigzag_setup_params},
@@ -49,6 +52,7 @@ use crate::{
         UnpaddedByteIndex, UnpaddedBytesAmount,
     },
 };
+use typenum::Unsigned;
 
 type TreeDomain<Tree> = <<Tree as MerkleTreeTrait>::Hasher as Hasher>::Domain;
 
@@ -96,6 +100,36 @@ pub struct ZigZagAux {
 }
 
 const ZIGZAG_AUX_FILE: &str = "zigzag-aux.json";
+
+fn commitment_from_domain<D: Into<blstrs::Scalar>>(domain: D) -> Commitment {
+    commitment_from_fr(domain.into())
+}
+
+fn reopen_zigzag_tree<Tree: 'static + MerkleTreeTrait>(
+    cache_path: &Path,
+    id: impl Into<String>,
+    base_tree_size: usize,
+) -> Result<Tree> {
+    let id = id.into();
+    let mut config = StoreConfig::new(cache_path, id.clone(), 0);
+    config.size = Some(base_tree_size);
+
+    let base_tree_leafs = get_base_tree_leafs::<Tree>(base_tree_size)
+        .with_context(|| format!("failed to compute leaf count for ZigZag tree store {id}"))?;
+    let store = Tree::Store::new_from_disk(base_tree_size, Tree::Arity::to_usize(), &config)
+        .with_context(|| format!("failed to open ZigZag tree store {id} at {:?}", config.path))?;
+    let tree = MerkleTree::<
+        TreeDomain<Tree>,
+        <Tree::Hasher as Hasher>::Function,
+        Tree::Store,
+        Tree::Arity,
+        Tree::SubTreeArity,
+        Tree::TopTreeArity,
+    >::from_data_store(store, base_tree_leafs)
+    .with_context(|| format!("failed to instantiate ZigZag tree {id}"))?;
+
+    Ok(Tree::from_merkle(tree))
+}
 
 /// Replicate fr32-padded `data` in place using ZigZag layered encoding.
 ///
@@ -246,6 +280,123 @@ pub fn zigzag_load_aux(cache_path: impl AsRef<Path>) -> Result<ZigZagAux> {
         .with_context(|| format!("failed to read zigzag aux at {:?}", aux_path))?;
     let aux: ZigZagAux = serde_json::from_slice(&bytes).context("deserialize zigzag aux")?;
     Ok(aux)
+}
+
+/// Produce a Groth16 proof from persisted ZigZag tree stores and the aux manifest.
+///
+/// This is the resumable equivalent of [`zigzag_prove`]. It does not load or reconstruct
+/// Stacked-style labels / `p_aux` / `t_aux`; it re-opens ZigZag's persisted Merkle stores
+/// (`zigzag-tree-d`, `zigzag-tree-r-*`) and validates them against [`ZigZagAux`].
+#[allow(clippy::too_many_arguments)]
+pub fn zigzag_prove_from_cache<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
+    cache_path: impl AsRef<Path>,
+    comm_d_in: Commitment,
+    comm_r_in: Commitment,
+    comm_r_star_in: Commitment,
+    prover_id: ProverId,
+    sector_id: SectorId,
+    ticket: Ticket,
+    seed: Option<Ticket>,
+) -> Result<SealCommitOutput> {
+    let cache_path = cache_path.as_ref();
+    let aux = zigzag_load_aux(cache_path)?;
+
+    ensure!(aux.comm_d == comm_d_in, "comm_d does not match zigzag aux");
+    ensure!(aux.comm_r == comm_r_in, "comm_r does not match zigzag aux");
+    ensure!(
+        aux.comm_r_star == comm_r_star_in,
+        "comm_r_star does not match zigzag aux"
+    );
+
+    let pub_params = zigzag_public_params::<Tree>(porep_config)?;
+    ensure!(
+        aux.layers == pub_params.layer_challenges.layers(),
+        "zigzag aux layer count ({}) does not match public params ({})",
+        aux.layers,
+        pub_params.layer_challenges.layers()
+    );
+
+    let comm_d: DefaultPieceDomain = as_safe_commitment(&comm_d_in, "comm_d")?;
+    let replica_id = generate_replica_id::<Tree::Hasher, _>(
+        &prover_id,
+        sector_id.into(),
+        &ticket,
+        comm_d_in,
+        &porep_config.porep_id,
+    );
+    let aux_replica_id: TreeDomain<Tree> =
+        as_safe_commitment(&aux.replica_id, "zigzag aux replica_id")?;
+    ensure!(
+        replica_id == aux_replica_id,
+        "computed replica_id does not match zigzag aux"
+    );
+
+    let data_tree_size =
+        get_base_tree_size::<BinaryMerkleTree<DefaultPieceHasher>>(porep_config.sector_size)
+            .context("failed to compute zigzag-tree-d store size")?;
+    let tree_d = reopen_zigzag_tree::<BinaryMerkleTree<DefaultPieceHasher>>(
+        cache_path,
+        "zigzag-tree-d",
+        data_tree_size,
+    )?;
+    ensure!(
+        commitment_from_domain(tree_d.root()) == comm_d_in,
+        "zigzag-tree-d root does not match comm_d"
+    );
+
+    let replica_tree_size = get_base_tree_size::<Tree>(porep_config.sector_size)
+        .context("failed to compute zigzag replica tree store size")?;
+    let replica_tree_leafs = get_base_tree_leafs::<Tree>(replica_tree_size)
+        .context("failed to compute zigzag replica tree leaf count")?;
+    ensure!(
+        replica_tree_leafs == pub_params.graph.size(),
+        "zigzag replica tree leaf count ({}) does not match graph size ({})",
+        replica_tree_leafs,
+        pub_params.graph.size()
+    );
+
+    let mut trees = Vec::with_capacity(aux.layers);
+    let mut layer_comm_rs = Vec::with_capacity(aux.layers);
+    for layer in 0..aux.layers {
+        let tree = reopen_zigzag_tree::<Tree>(
+            cache_path,
+            format!("zigzag-tree-r-{layer}"),
+            replica_tree_size,
+        )?;
+        layer_comm_rs.push(tree.root());
+        trees.push(tree);
+    }
+
+    ensure!(
+        commitment_from_domain(
+            *layer_comm_rs
+                .last()
+                .context("zigzag aux reported zero layers")?
+        ) == comm_r_in,
+        "final zigzag replica tree root does not match comm_r"
+    );
+
+    let computed_comm_r_star = comm_r_star::<Tree::Hasher>(&replica_id, &layer_comm_rs)
+        .context("failed to recompute comm_r_star from cached ZigZag trees")?;
+    ensure!(
+        commitment_from_domain(computed_comm_r_star) == comm_r_star_in,
+        "cached ZigZag tree roots do not match comm_r_star"
+    );
+
+    let tau = Tau {
+        comm_d,
+        layer_comm_rs,
+        comm_r_star: computed_comm_r_star,
+    };
+    let state = ZigZagProverState {
+        replica_id,
+        tau,
+        tree_d,
+        trees,
+    };
+
+    zigzag_prove::<Tree>(porep_config, state, seed)
 }
 
 /// Produce a Groth16 proof for a previously replicated sector.

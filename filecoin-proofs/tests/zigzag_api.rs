@@ -18,8 +18,8 @@ use filecoin_proofs::types::{
 };
 use filecoin_proofs::{
     add_piece, zigzag_comm_r_bound, zigzag_load_aux, zigzag_pre_commit,
-    zigzag_pre_commit_phase1, zigzag_pre_commit_phase2, zigzag_prove, zigzag_unseal,
-    zigzag_unseal_range, zigzag_verify_seal,
+    zigzag_pre_commit_phase1, zigzag_pre_commit_phase2, zigzag_prove, zigzag_prove_from_cache,
+    zigzag_unseal, zigzag_unseal_range, zigzag_verify_seal,
 };
 use rand::rngs::OsRng;
 use storage_proofs_core::{
@@ -226,6 +226,89 @@ fn zigzag_seal_lifecycle(sector_size: u64) {
     assert_eq!(data, original, "extraction did not recover the original data");
 }
 
+fn zigzag_cached_seal_lifecycle(sector_size: u64) {
+    let param_cache_dir = std::env::temp_dir().join(format!(
+        "zigzag-cached-params-{}-{}",
+        sector_size,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&param_cache_dir);
+    std::fs::create_dir_all(&param_cache_dir).expect("failed to create param cache dir");
+    std::env::set_var("FIL_PROOFS_PARAMETER_CACHE", &param_cache_dir);
+
+    let seal_cache_dir = std::env::temp_dir().join(format!(
+        "zigzag-cached-seal-{}-{}",
+        sector_size,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&seal_cache_dir);
+    std::fs::create_dir_all(&seal_cache_dir).expect("failed to create seal cache dir");
+
+    let porep_config = PoRepConfig::new_groth16(sector_size, POREP_ID, ApiVersion::V1_2_0);
+    let sector_id = SectorId::from(0);
+
+    generate_zigzag_params(&porep_config);
+
+    let (original, piece_infos) = stage_sector(sector_size);
+    let mut data = original.clone();
+
+    let (phase1_out, state) = zigzag_pre_commit_phase1::<ZigZagTree>(
+        &porep_config,
+        &seal_cache_dir,
+        PROVER_ID,
+        sector_id,
+        TICKET,
+        &mut data,
+        &piece_infos,
+    )
+    .expect("zigzag_pre_commit_phase1 failed");
+
+    let phase2_out = zigzag_pre_commit_phase2(&seal_cache_dir, &phase1_out).expect("phase2 failed");
+    assert_eq!(phase1_out, phase2_out);
+    drop(state);
+
+    let commit = zigzag_prove_from_cache::<ZigZagTree>(
+        &porep_config,
+        &seal_cache_dir,
+        phase2_out.comm_d,
+        phase2_out.comm_r,
+        phase2_out.comm_r_star,
+        PROVER_ID,
+        sector_id,
+        TICKET,
+        Some(SEED),
+    )
+    .expect("zigzag_prove_from_cache failed");
+
+    let verified = zigzag_verify_seal::<ZigZagTree>(
+        &porep_config,
+        phase2_out.comm_r,
+        phase2_out.comm_d,
+        phase2_out.comm_r_star,
+        PROVER_ID,
+        sector_id,
+        TICKET,
+        Some(SEED),
+        &commit.proof,
+    )
+    .expect("zigzag_verify_seal errored");
+    assert!(verified, "cached zigzag proof failed to verify");
+
+    zigzag_unseal::<ZigZagTree>(
+        &porep_config,
+        PROVER_ID,
+        sector_id,
+        TICKET,
+        phase2_out.comm_d,
+        &mut data,
+    )
+    .expect("zigzag_unseal failed");
+    assert_eq!(data, original, "extraction did not recover the original data");
+
+    let _ = std::fs::remove_dir_all(&seal_cache_dir);
+    let _ = std::fs::remove_dir_all(&param_cache_dir);
+}
+
 #[test]
 fn test_zigzag_extract_roundtrip_2kib() {
     zigzag_extract_lifecycle(SECTOR_SIZE_2_KIB);
@@ -294,4 +377,10 @@ fn test_zigzag_extract_roundtrip_16mib() {
 #[ignore = "generates Groth16 parameters and a full proof; slow"]
 fn test_zigzag_seal_lifecycle_2kib() {
     zigzag_seal_lifecycle(SECTOR_SIZE_2_KIB);
+}
+
+#[test]
+#[ignore = "generates Groth16 parameters and proves from disk-backed ZigZag trees; slow"]
+fn test_zigzag_cached_seal_lifecycle_2kib() {
+    zigzag_cached_seal_lifecycle(SECTOR_SIZE_2_KIB);
 }
