@@ -10,6 +10,7 @@
 //! * (for the small size, behind `--ignored`) a full Groth16 proof verifies with a challenge seed.
 
 use std::io::Cursor;
+use std::path::PathBuf;
 
 use filecoin_proofs::constants::{ZigZagTree, SECTOR_SIZE_16_MIB, SECTOR_SIZE_2_KIB};
 use filecoin_proofs::parameters::zigzag_public_params;
@@ -17,23 +18,36 @@ use filecoin_proofs::types::{
     PaddedBytesAmount, PieceInfo, PoRepConfig, UnpaddedByteIndex, UnpaddedBytesAmount,
 };
 use filecoin_proofs::{
-    add_piece, zigzag_comm_r_bound, zigzag_load_aux, zigzag_pre_commit,
-    zigzag_pre_commit_phase1, zigzag_pre_commit_phase2, zigzag_prove, zigzag_prove_from_cache,
-    zigzag_unseal, zigzag_unseal_range, zigzag_verify_seal,
+    add_piece, zigzag_comm_r_bound, zigzag_load_aux, zigzag_pre_commit, zigzag_pre_commit_phase1,
+    zigzag_pre_commit_phase1_with_replica_id, zigzag_pre_commit_phase2, zigzag_prove,
+    zigzag_prove_from_cache, zigzag_unseal, zigzag_unseal_range, zigzag_verify_seal,
 };
 use rand::rngs::OsRng;
+use serde::Deserialize;
 use storage_proofs_core::{
-    api_version::ApiVersion,
-    compound_proof::CompoundProof,
-    parameter_cache::CacheableParameters,
+    api_version::ApiVersion, compound_proof::CompoundProof, parameter_cache::CacheableParameters,
     sector::SectorId,
 };
 use storage_proofs_porep::zigzag::{circuit::ZigZagCompound, ZigZagDrgPoRep};
 
 const PROVER_ID: [u8; 32] = [4u8; 32];
 const TICKET: [u8; 32] = [7u8; 32];
-const SEED: [u8; 32] = [9u8; 32];
+const SEED: [u8; 32] = [0xffu8; 32];
 const POREP_ID: [u8; 32] = [42u8; 32];
+
+#[derive(Debug, Deserialize)]
+struct CurioZigZagProofSidecar {
+    registered_proof: i32,
+    sector_id: u64,
+    comm_d: [u8; 32],
+    bound_comm_r: [u8; 32],
+    comm_r: [u8; 32],
+    comm_r_star: [u8; 32],
+    prover_id: [u8; 32],
+    ticket: [u8; 32],
+    seed: [u8; 32],
+    proof_prefix_hex: String,
+}
 
 /// Build a full fr32-padded sector from random user bytes via `add_piece`, returning the padded
 /// sector data and the piece info.
@@ -44,13 +58,8 @@ fn stage_sector(sector_size: u64) -> (Vec<u8>, Vec<PieceInfo>) {
         .collect();
 
     let mut staged = Vec::new();
-    let (piece_info, _written) = add_piece(
-        Cursor::new(&user_bytes),
-        &mut staged,
-        unpadded,
-        &[],
-    )
-    .expect("add_piece failed");
+    let (piece_info, _written) =
+        add_piece(Cursor::new(&user_bytes), &mut staged, unpadded, &[]).expect("add_piece failed");
 
     assert_eq!(staged.len(), sector_size as usize);
     (staged, vec![piece_info])
@@ -94,7 +103,10 @@ fn zigzag_extract_lifecycle(sector_size: u64) {
         &mut data,
     )
     .expect("zigzag_unseal failed");
-    assert_eq!(data, original, "extraction did not recover the original data");
+    assert_eq!(
+        data, original,
+        "extraction did not recover the original data"
+    );
 
     // Ranged unseal returns unpadded user bytes.
     let mut sealed = original.clone();
@@ -131,8 +143,8 @@ fn zigzag_extract_lifecycle(sector_size: u64) {
 fn generate_zigzag_params(porep_config: &PoRepConfig) {
     use filecoin_proofs::constants::DefaultPieceHasher;
 
-    let public_params =
-        zigzag_public_params::<ZigZagTree>(porep_config).expect("failed to get zigzag public params");
+    let public_params = zigzag_public_params::<ZigZagTree>(porep_config)
+        .expect("failed to get zigzag public params");
 
     let circuit = <ZigZagCompound<ZigZagTree, DefaultPieceHasher> as CompoundProof<
         ZigZagDrgPoRep<ZigZagTree, DefaultPieceHasher>,
@@ -151,6 +163,23 @@ fn generate_zigzag_params(porep_config: &PoRepConfig) {
         &public_params,
     )
     .expect("failed to generate verifying key");
+}
+
+fn porep_id_from_registered_proof(registered_proof: i32) -> [u8; 32] {
+    let mut porep_id = [0u8; 32];
+    porep_id[..8].copy_from_slice(&(registered_proof as u64).to_le_bytes());
+    porep_id
+}
+
+fn sector_size_from_registered_proof(registered_proof: i32) -> u64 {
+    match registered_proof {
+        5 | 10 | 15 => SECTOR_SIZE_2_KIB,
+        6 | 11 | 16 => 8 * 1024 * 1024,
+        _ => panic!(
+            "unsupported Curio ZigZag diagnostic proof type {}",
+            registered_proof
+        ),
+    }
 }
 
 fn zigzag_seal_lifecycle(sector_size: u64) {
@@ -181,8 +210,8 @@ fn zigzag_seal_lifecycle(sector_size: u64) {
     )
     .expect("zigzag_pre_commit failed");
 
-    let commit = zigzag_prove::<ZigZagTree>(&porep_config, state, Some(SEED))
-        .expect("zigzag_prove failed");
+    let commit =
+        zigzag_prove::<ZigZagTree>(&porep_config, state, Some(SEED)).expect("zigzag_prove failed");
 
     let verified = zigzag_verify_seal::<ZigZagTree>(
         &porep_config,
@@ -223,7 +252,80 @@ fn zigzag_seal_lifecycle(sector_size: u64) {
         &mut data,
     )
     .expect("zigzag_unseal failed");
-    assert_eq!(data, original, "extraction did not recover the original data");
+    assert_eq!(
+        data, original,
+        "extraction did not recover the original data"
+    );
+}
+
+#[test]
+#[ignore = "diagnostic: set ZIGZAG_CURIO_CACHE_PATH and ZIGZAG_CURIO_SIDECAR_PATH"]
+fn test_zigzag_verify_curio_cache_from_sidecar() {
+    let cache_path = PathBuf::from(
+        std::env::var("ZIGZAG_CURIO_CACHE_PATH").expect("set ZIGZAG_CURIO_CACHE_PATH"),
+    );
+    let sidecar_path = PathBuf::from(
+        std::env::var("ZIGZAG_CURIO_SIDECAR_PATH").expect("set ZIGZAG_CURIO_SIDECAR_PATH"),
+    );
+    if let Ok(parameter_cache) = std::env::var("ZIGZAG_CURIO_PARAMETER_CACHE") {
+        std::env::set_var("FIL_PROOFS_PARAMETER_CACHE", parameter_cache);
+    }
+
+    let sidecar: CurioZigZagProofSidecar =
+        serde_json::from_slice(&std::fs::read(&sidecar_path).expect("read sidecar"))
+            .expect("deserialize sidecar");
+    assert_eq!(
+        zigzag_comm_r_bound(&sidecar.comm_r, &sidecar.comm_r_star),
+        sidecar.bound_comm_r
+    );
+
+    let porep_config = PoRepConfig::new_groth16(
+        sector_size_from_registered_proof(sidecar.registered_proof),
+        porep_id_from_registered_proof(sidecar.registered_proof),
+        ApiVersion::V1_2_0,
+    );
+    let sector_id = SectorId::from(sidecar.sector_id);
+
+    let commit = zigzag_prove_from_cache::<ZigZagTree>(
+        &porep_config,
+        &cache_path,
+        sidecar.comm_d,
+        sidecar.comm_r,
+        sidecar.comm_r_star,
+        sidecar.prover_id,
+        sector_id,
+        sidecar.ticket,
+        Some(sidecar.seed),
+    )
+    .expect("zigzag_prove_from_cache failed");
+    assert_eq!(commit.proof.len(), 192);
+
+    let proof = if let Ok(proof_hex_path) = std::env::var("ZIGZAG_CURIO_PROOF_HEX_PATH") {
+        let proof_hex = std::fs::read_to_string(proof_hex_path).expect("read Curio proof hex");
+        hex::decode(proof_hex.trim()).expect("decode Curio proof hex")
+    } else {
+        commit.proof
+    };
+    assert_eq!(proof.len(), 192);
+    assert_eq!(
+        hex::encode(&proof[..16]),
+        sidecar.proof_prefix_hex,
+        "Curio proof bytes do not match the sidecar proof prefix"
+    );
+
+    let verified = zigzag_verify_seal::<ZigZagTree>(
+        &porep_config,
+        sidecar.comm_r,
+        sidecar.comm_d,
+        sidecar.comm_r_star,
+        sidecar.prover_id,
+        sector_id,
+        sidecar.ticket,
+        Some(sidecar.seed),
+        &proof,
+    )
+    .expect("zigzag_verify_seal errored");
+    assert!(verified, "cached Curio ZigZag proof failed to verify");
 }
 
 fn zigzag_cached_seal_lifecycle(sector_size: u64) {
@@ -267,6 +369,28 @@ fn zigzag_cached_seal_lifecycle(sector_size: u64) {
     assert_eq!(phase1_out, phase2_out);
     drop(state);
 
+    let aux = zigzag_load_aux(&seal_cache_dir).expect("load aux");
+    let split_cache_dir = std::env::temp_dir().join(format!(
+        "zigzag-split-seal-{}-{}",
+        sector_size,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&split_cache_dir);
+    std::fs::create_dir_all(&split_cache_dir).expect("failed to create split seal cache dir");
+
+    let mut split_data = original.clone();
+    let (split_phase1_out, _split_state) = zigzag_pre_commit_phase1_with_replica_id::<ZigZagTree>(
+        &porep_config,
+        &split_cache_dir,
+        aux.replica_id,
+        phase1_out.comm_d,
+        &mut split_data,
+    )
+    .expect("zigzag_pre_commit_phase1_with_replica_id failed");
+    assert_eq!(split_phase1_out, phase1_out);
+    let split_aux = zigzag_load_aux(&split_cache_dir).expect("load split aux");
+    assert_eq!(split_aux.replica_id, aux.replica_id);
+
     let commit = zigzag_prove_from_cache::<ZigZagTree>(
         &porep_config,
         &seal_cache_dir,
@@ -303,9 +427,13 @@ fn zigzag_cached_seal_lifecycle(sector_size: u64) {
         &mut data,
     )
     .expect("zigzag_unseal failed");
-    assert_eq!(data, original, "extraction did not recover the original data");
+    assert_eq!(
+        data, original,
+        "extraction did not recover the original data"
+    );
 
     let _ = std::fs::remove_dir_all(&seal_cache_dir);
+    let _ = std::fs::remove_dir_all(&split_cache_dir);
     let _ = std::fs::remove_dir_all(&param_cache_dir);
 }
 
@@ -349,7 +477,9 @@ fn test_zigzag_disk_backed_phase1_phase2_2kib() {
     assert_eq!(aux.comm_d, phase1_out.comm_d);
     assert_eq!(aux.comm_r, phase1_out.comm_r);
     assert_eq!(aux.comm_r_star, phase1_out.comm_r_star);
-    assert!(cache_dir.join("zigzag-tree-d.dat").exists() || cache_dir.read_dir().unwrap().count() > 1);
+    assert!(
+        cache_dir.join("zigzag-tree-d.dat").exists() || cache_dir.read_dir().unwrap().count() > 1
+    );
 
     // Prover state from phase1 still works for extraction.
     drop(state);

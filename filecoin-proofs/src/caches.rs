@@ -32,6 +32,21 @@ pub type Bls12PreparedVerifyingKey = groth16::PreparedVerifyingKey<Bls12>;
 type Bls12ProverSRSKey = groth16::aggregate::ProverSRS<Bls12>;
 type Bls12VerifierSRSKey = groth16::aggregate::VerifierSRS<Bls12>;
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn should_generate_missing_zigzag_params() -> bool {
+    env_flag_enabled("FIL_PROOFS_ZIGZAG_GENERATE_MISSING_PARAMS")
+}
+
 type Cache<G> = HashMap<String, Arc<G>>;
 type GrothMemCache = Cache<Bls12GrothParams>;
 type VerifyingKeyMemCache = Cache<Bls12PreparedVerifyingKey>;
@@ -224,6 +239,14 @@ pub(crate) fn get_zigzag_params<Tree: 'static + MerkleTreeTrait>(
     let public_params = zigzag_public_params::<Tree>(porep_config)?;
 
     let parameters_generator = || {
+        if should_generate_missing_zigzag_params() {
+            let mut rng = OsRng;
+            return <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
+                ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
+                _,
+            >>::groth_params::<OsRng>(Some(&mut rng), &public_params);
+        }
+
         <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
             ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
             _,
@@ -334,6 +357,15 @@ pub(crate) fn get_zigzag_verifying_key<Tree: 'static + MerkleTreeTrait>(
     let public_params = zigzag_public_params::<Tree>(porep_config)?;
 
     let vk_generator = || {
+        if should_generate_missing_zigzag_params() {
+            let mut rng = OsRng;
+            let vk = <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
+                ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
+                _,
+            >>::verifying_key::<OsRng>(Some(&mut rng), &public_params)?;
+            return Ok(prepare_verifying_key(&vk));
+        }
+
         let vk = <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
             ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
             _,

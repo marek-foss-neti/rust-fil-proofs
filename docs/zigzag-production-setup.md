@@ -44,6 +44,11 @@ If the bound commitment is chosen, the seal proof or proof inputs must still car
 the verifier to recover both `comm_r` and `comm_r_star`. Production code should not rely on an
 undocumented proof envelope.
 
+Local devnets may use a shared sidecar file to map a raw 192-byte proof back to ZigZag's
+`comm_r` and `comm_r_star` while reusing an existing actor proof type. That is not a production
+ABI. Production must encode the commitment layout, proof byte limits, and verifier inputs in the
+registered proof type and actor/syscall interfaces.
+
 ## 3. Register protocol proof types
 
 Allocate official protocol identifiers for:
@@ -81,6 +86,9 @@ Required work:
 
 `paramcache --only-zigzag` is acceptable for local seal parameters. It is not ceremony-grade. The
 production path must use published parameter manifests and verifiable digests.
+
+Do not enable `FIL_PROOFS_ZIGZAG_GENERATE_MISSING_PARAMS` in production. Production nodes should
+fail closed when a ZigZag parameter file is missing or fails digest validation.
 
 ## 5. Implement production PoSt support
 

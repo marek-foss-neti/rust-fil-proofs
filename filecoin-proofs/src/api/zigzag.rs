@@ -20,8 +20,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
+use ff::PrimeField;
 use filecoin_hashers::Hasher;
-use fr32::write_unpadded;
+use fr32::{bytes_into_fr_repr_safe, write_unpadded};
 use merkletree::{merkle::MerkleTree, store::StoreConfig};
 use serde::{Deserialize, Serialize};
 use storage_proofs_core::{
@@ -105,6 +106,16 @@ fn commitment_from_domain<D: Into<blstrs::Scalar>>(domain: D) -> Commitment {
     commitment_from_fr(domain.into())
 }
 
+// Filecoin interactive randomness is arbitrary chain randomness, not an Fr-safe commitment.
+fn challenge_seed_from_randomness<Tree: MerkleTreeTrait>(seed: Ticket) -> TreeDomain<Tree>
+where
+    TreeDomain<Tree>: From<blstrs::Scalar>,
+{
+    let seed_fr = blstrs::Scalar::from_repr_vartime(bytes_into_fr_repr_safe(&seed))
+        .expect("bytes_into_fr_repr_safe always produces a valid Fr representation");
+    seed_fr.into()
+}
+
 fn reopen_zigzag_tree<Tree: 'static + MerkleTreeTrait>(
     cache_path: &Path,
     id: impl Into<String>,
@@ -131,21 +142,7 @@ fn reopen_zigzag_tree<Tree: 'static + MerkleTreeTrait>(
     Ok(Tree::from_merkle(tree))
 }
 
-/// Replicate fr32-padded `data` in place using ZigZag layered encoding.
-///
-/// `data` must be exactly the padded sector size. `piece_infos` must describe the pieces that
-/// were written into `data` (via [`crate::add_piece`]); they are verified against the resulting
-/// Sha256 CommD. When `cache_path` is `Some`, Merkle trees are persisted under that directory
-/// (disk-backed stores) and a [`ZigZagAux`] manifest is written for resumability.
-pub fn zigzag_pre_commit<Tree: 'static + MerkleTreeTrait>(
-    porep_config: &PoRepConfig,
-    prover_id: ProverId,
-    sector_id: SectorId,
-    ticket: Ticket,
-    data: &mut [u8],
-    piece_infos: &[PieceInfo],
-    cache_path: Option<&Path>,
-) -> Result<(ZigZagPreCommitOutput, ZigZagProverState<Tree>)> {
+fn validate_zigzag_sector_data(porep_config: &PoRepConfig, data: &[u8]) -> Result<()> {
     let sector_bytes = usize::from(porep_config.padded_bytes_amount());
     ensure!(
         data.len() == sector_bytes,
@@ -159,29 +156,28 @@ pub fn zigzag_pre_commit<Tree: 'static + MerkleTreeTrait>(
         data.len(),
         NODE_SIZE,
     );
-    ensure!(!piece_infos.is_empty(), "piece_infos must not be empty");
 
-    let pub_params = zigzag_public_params::<Tree>(porep_config)?;
+    Ok(())
+}
+
+fn zigzag_comm_d_from_data(data: &[u8]) -> Result<Commitment> {
     let leaves = data.len() / NODE_SIZE;
-
-    // Sha256 CommD over the fr32-padded sector data (matches Filecoin piece aggregation).
     let tree_d_preview =
         create_base_merkle_tree::<BinaryMerkleTree<DefaultPieceHasher>>(None, leaves, data)?;
     let comm_d = commitment_from_fr(tree_d_preview.root().into());
     drop(tree_d_preview);
 
-    ensure!(
-        verify_pieces(&comm_d, piece_infos, porep_config.sector_size)?,
-        "pieces and comm_d do not match"
-    );
+    Ok(comm_d)
+}
 
-    let replica_id = generate_replica_id::<Tree::Hasher, _>(
-        &prover_id,
-        sector_id.into(),
-        &ticket,
-        comm_d,
-        &porep_config.porep_id,
-    );
+fn zigzag_pre_commit_with_replica_id_domain<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
+    replica_id: TreeDomain<Tree>,
+    comm_d: Commitment,
+    data: &mut [u8],
+    cache_path: Option<&Path>,
+) -> Result<(ZigZagPreCommitOutput, ZigZagProverState<Tree>)> {
+    let pub_params = zigzag_public_params::<Tree>(porep_config)?;
 
     if let Some(path) = cache_path {
         fs::create_dir_all(path).context("failed to create zigzag cache directory")?;
@@ -227,6 +223,43 @@ pub fn zigzag_pre_commit<Tree: 'static + MerkleTreeTrait>(
     Ok((out, state))
 }
 
+/// Replicate fr32-padded `data` in place using ZigZag layered encoding.
+///
+/// `data` must be exactly the padded sector size. `piece_infos` must describe the pieces that
+/// were written into `data` (via [`crate::add_piece`]); they are verified against the resulting
+/// Sha256 CommD. When `cache_path` is `Some`, Merkle trees are persisted under that directory
+/// (disk-backed stores) and a [`ZigZagAux`] manifest is written for resumability.
+pub fn zigzag_pre_commit<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
+    prover_id: ProverId,
+    sector_id: SectorId,
+    ticket: Ticket,
+    data: &mut [u8],
+    piece_infos: &[PieceInfo],
+    cache_path: Option<&Path>,
+) -> Result<(ZigZagPreCommitOutput, ZigZagProverState<Tree>)> {
+    validate_zigzag_sector_data(porep_config, data)?;
+    ensure!(!piece_infos.is_empty(), "piece_infos must not be empty");
+
+    // Sha256 CommD over the fr32-padded sector data (matches Filecoin piece aggregation).
+    let comm_d = zigzag_comm_d_from_data(data)?;
+
+    ensure!(
+        verify_pieces(&comm_d, piece_infos, porep_config.sector_size)?,
+        "pieces and comm_d do not match"
+    );
+
+    let replica_id = generate_replica_id::<Tree::Hasher, _>(
+        &prover_id,
+        sector_id.into(),
+        &ticket,
+        comm_d,
+        &porep_config.porep_id,
+    );
+
+    zigzag_pre_commit_with_replica_id_domain(porep_config, replica_id, comm_d, data, cache_path)
+}
+
 /// Phase 1 of ZigZag pre-commit: replicate into `data`, persist disk-backed trees and a
 /// [`ZigZagAux`] manifest under `cache_path`.
 ///
@@ -250,6 +283,39 @@ pub fn zigzag_pre_commit_phase1<Tree: 'static + MerkleTreeTrait>(
         ticket,
         data,
         piece_infos,
+        Some(cache_path.as_ref()),
+    )
+}
+
+/// Phase 1 of ZigZag pre-commit when the caller already computed Filecoin's replica ID.
+///
+/// This supports split seal pipelines such as Curio's SDR/TreeD/TreeRC flow, where the replica ID
+/// is computed before the FFI pre-commit phase receives enough context to derive it again. The
+/// provided `comm_d` is still checked against the fr32-padded sector data before replication.
+pub fn zigzag_pre_commit_phase1_with_replica_id<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
+    cache_path: impl AsRef<Path>,
+    replica_id: Commitment,
+    comm_d: Commitment,
+    data: &mut [u8],
+) -> Result<(ZigZagPreCommitOutput, ZigZagProverState<Tree>)> {
+    validate_zigzag_sector_data(porep_config, data)?;
+    ensure!(comm_d != [0; 32], "Invalid all zero commitment (comm_d)");
+    ensure!(
+        replica_id != [0; 32],
+        "Invalid all zero commitment (replica_id)"
+    );
+    ensure!(
+        zigzag_comm_d_from_data(data)? == comm_d,
+        "provided comm_d does not match sector data"
+    );
+
+    let replica_id = as_safe_commitment::<TreeDomain<Tree>, _>(&replica_id, "replica_id")?;
+    zigzag_pre_commit_with_replica_id_domain(
+        porep_config,
+        replica_id,
+        comm_d,
+        data,
         Some(cache_path.as_ref()),
     )
 }
@@ -298,7 +364,10 @@ pub fn zigzag_prove_from_cache<Tree: 'static + MerkleTreeTrait>(
     sector_id: SectorId,
     ticket: Ticket,
     seed: Option<Ticket>,
-) -> Result<SealCommitOutput> {
+) -> Result<SealCommitOutput>
+where
+    TreeDomain<Tree>: From<blstrs::Scalar>,
+{
     let cache_path = cache_path.as_ref();
     let aux = zigzag_load_aux(cache_path)?;
 
@@ -407,7 +476,10 @@ pub fn zigzag_prove<Tree: 'static + MerkleTreeTrait>(
     porep_config: &PoRepConfig,
     state: ZigZagProverState<Tree>,
     seed: Option<Ticket>,
-) -> Result<SealCommitOutput> {
+) -> Result<SealCommitOutput>
+where
+    TreeDomain<Tree>: From<blstrs::Scalar>,
+{
     let ZigZagProverState {
         replica_id,
         tau,
@@ -423,9 +495,7 @@ pub fn zigzag_prove<Tree: 'static + MerkleTreeTrait>(
     let compound_public_params =
         ZigZagCompound::<Tree, DefaultPieceHasher>::setup(&compound_setup_params)?;
 
-    let seed_domain = seed
-        .map(|s| as_safe_commitment::<TreeDomain<Tree>, _>(&s, "seed"))
-        .transpose()?;
+    let seed_domain = seed.map(challenge_seed_from_randomness::<Tree>);
 
     let public_inputs = PublicInputs {
         replica_id,
@@ -470,7 +540,10 @@ pub fn zigzag_verify_seal<Tree: 'static + MerkleTreeTrait>(
     ticket: Ticket,
     seed: Option<Ticket>,
     proof_vec: &[u8],
-) -> Result<bool> {
+) -> Result<bool>
+where
+    TreeDomain<Tree>: From<blstrs::Scalar>,
+{
     ensure!(comm_d_in != [0; 32], "Invalid all zero commitment (comm_d)");
     ensure!(comm_r_in != [0; 32], "Invalid all zero commitment (comm_r)");
     ensure!(
@@ -491,9 +564,7 @@ pub fn zigzag_verify_seal<Tree: 'static + MerkleTreeTrait>(
         &porep_config.porep_id,
     );
 
-    let seed_domain = seed
-        .map(|s| as_safe_commitment::<TreeDomain<Tree>, _>(&s, "seed"))
-        .transpose()?;
+    let seed_domain = seed.map(challenge_seed_from_randomness::<Tree>);
 
     let compound_setup_params = compound_proof::SetupParams {
         vanilla_params: zigzag_setup_params(porep_config)?,
@@ -578,14 +649,7 @@ pub fn zigzag_unseal_range<Tree: 'static + MerkleTreeTrait, W: Write>(
     offset: UnpaddedByteIndex,
     num_bytes: UnpaddedBytesAmount,
 ) -> Result<UnpaddedBytesAmount> {
-    zigzag_unseal::<Tree>(
-        porep_config,
-        prover_id,
-        sector_id,
-        ticket,
-        comm_d_in,
-        data,
-    )?;
+    zigzag_unseal::<Tree>(porep_config, prover_id, sector_id, ticket, comm_d_in, data)?;
 
     let offset_padded: PaddedBytesAmount = UnpaddedBytesAmount::from(offset).into();
     let num_bytes_padded: PaddedBytesAmount = num_bytes.into();
