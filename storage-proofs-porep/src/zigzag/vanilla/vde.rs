@@ -6,11 +6,45 @@ use storage_proofs_core::{
     drgraph::Graph,
     error::Result,
     parameter_cache::ParameterSetMetadata,
+    settings::SETTINGS,
     util::{data_at_node, data_at_node_offset, NODE_SIZE},
 };
 
 use crate::encode;
 use crate::zigzag::vanilla::graph::ZigZagGraph;
+use crate::zigzag::vanilla::parent_table::ZigZagParentTable;
+
+const DECODE_CHUNK_NODES: usize = 16 * 1024;
+
+struct DecodeScratch {
+    parents: Vec<u32>,
+    key_input: Vec<u8>,
+}
+
+impl DecodeScratch {
+    fn new(degree: usize) -> Self {
+        DecodeScratch {
+            parents: vec![0u32; degree],
+            key_input: Vec::with_capacity(NODE_SIZE * (degree + 1)),
+        }
+    }
+}
+
+/// Opens or generates the optional on-disk ZigZag parent table for `graph`.
+///
+/// This is primarily useful for benchmarks and process startup warmups, so the expensive table
+/// generation cost can be kept outside encode/decode timing windows.
+pub fn prepare_parent_table<H, G>(graph: &ZigZagGraph<H, G>) -> Result<()>
+where
+    H: Hasher,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+{
+    if SETTINGS.use_zigzag_parent_cache {
+        let _parent_table = ZigZagParentTable::new(graph)?;
+    }
+
+    Ok(())
+}
 
 /// Encodes `data` in place using the ZigZag `graph`.
 ///
@@ -32,6 +66,11 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
+    let parent_table = if SETTINGS.use_zigzag_parent_cache {
+        Some(ZigZagParentTable::new(graph)?)
+    } else {
+        None
+    };
     let mut parents = vec![0u32; graph.degree()];
     for n in 0..graph.size() {
         let node = if graph.forward() {
@@ -41,7 +80,7 @@ where
             (graph.size() - n) - 1
         };
 
-        graph.parents(node, &mut parents)?;
+        fill_parents(graph, parent_table.as_ref(), node, &mut parents)?;
 
         let key = create_key::<H>(replica_id, node, &parents, data)?;
         let start = data_at_node_offset(node);
@@ -73,12 +112,32 @@ where
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     let mut out = vec![0u8; data.len()];
+    let parent_table = if SETTINGS.use_zigzag_parent_cache {
+        Some(ZigZagParentTable::new(graph)?)
+    } else {
+        None
+    };
+    let parent_table = parent_table.as_ref();
 
-    out.par_chunks_mut(NODE_SIZE)
+    out.par_chunks_mut(DECODE_CHUNK_NODES * NODE_SIZE)
         .enumerate()
-        .try_for_each(|(node, chunk)| -> Result<()> {
-            let decoded = decode_block(graph, replica_id, data, node)?;
-            decoded.write_bytes(chunk)?;
+        .try_for_each(|(chunk_index, chunk)| -> Result<()> {
+            let mut scratch = DecodeScratch::new(graph.degree());
+            let base_node = chunk_index * DECODE_CHUNK_NODES;
+
+            for (chunk_node, node_out) in chunk.chunks_mut(NODE_SIZE).enumerate() {
+                let node = base_node + chunk_node;
+                let decoded = decode_block_with_scratch(
+                    graph,
+                    parent_table,
+                    replica_id,
+                    data,
+                    node,
+                    &mut scratch,
+                )?;
+                decoded.write_bytes(node_out)?;
+            }
+
             Ok(())
         })?;
 
@@ -99,12 +158,50 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
-    let mut parents = vec![0u32; graph.degree()];
-    graph.parents(v, &mut parents)?;
-    let key = create_key::<H>(replica_id, v, &parents, data)?;
+    let mut scratch = DecodeScratch::new(graph.degree());
+    decode_block_with_scratch(graph, None, replica_id, data, v, &mut scratch)
+}
+
+fn decode_block_with_scratch<H, G>(
+    graph: &ZigZagGraph<H, G>,
+    parent_table: Option<&ZigZagParentTable>,
+    replica_id: &H::Domain,
+    data: &[u8],
+    v: usize,
+    scratch: &mut DecodeScratch,
+) -> Result<H::Domain>
+where
+    H: Hasher,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+{
+    fill_parents(graph, parent_table, v, &mut scratch.parents)?;
+    let key = create_key_with_staged_input::<H>(
+        replica_id,
+        v,
+        &scratch.parents,
+        data,
+        &mut scratch.key_input,
+    );
     let node_data = H::Domain::try_from_bytes(data_at_node(data, v)?)?;
 
     Ok(encode::decode(key, node_data))
+}
+
+fn fill_parents<H, G>(
+    graph: &ZigZagGraph<H, G>,
+    parent_table: Option<&ZigZagParentTable>,
+    node: usize,
+    parents: &mut [u32],
+) -> Result<()>
+where
+    H: Hasher,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+{
+    if let Some(parent_table) = parent_table {
+        parent_table.read_into(node, parents)
+    } else {
+        graph.parents(node, parents)
+    }
 }
 
 /// Creates the encoding key: `SHA256(replica_id | parent_1 | parent_2 | ...)`, reduced to a field
@@ -119,7 +216,7 @@ pub fn create_key<H: Hasher>(
     data: &[u8],
 ) -> Result<H::Domain> {
     let mut hasher = Sha256::new();
-    hasher.update(id.into_bytes().as_slice());
+    hasher.update(AsRef::<[u8]>::as_ref(id));
 
     // The hash is about the parents, hence skip if a node doesn't have any parents.
     if node != parents[0] as usize {
@@ -133,18 +230,41 @@ pub fn create_key<H: Hasher>(
     Ok(bytes_into_fr_repr_safe(hash.as_ref()).into())
 }
 
+fn create_key_with_staged_input<H: Hasher>(
+    id: &H::Domain,
+    node: usize,
+    parents: &[u32],
+    data: &[u8],
+    key_input: &mut Vec<u8>,
+) -> H::Domain {
+    key_input.clear();
+    key_input.extend_from_slice(AsRef::<[u8]>::as_ref(id));
+
+    // The hash is about the parents, hence skip if a node doesn't have any parents.
+    if node != parents[0] as usize {
+        for parent in parents.iter() {
+            let offset = data_at_node_offset(*parent as usize);
+            key_input.extend_from_slice(&data[offset..offset + NODE_SIZE]);
+        }
+    }
+
+    let hash = Sha256::digest(key_input.as_slice());
+    bytes_into_fr_repr_safe(hash.as_ref()).into()
+}
+
 /// Recreates the encoding key from already-materialized parent domain values (used during
 /// verification, where parent bytes come from Merkle-proof leaves rather than the data buffer).
 /// This must match `create_key`'s hashing exactly.
+#[allow(clippy::unnecessary_wraps)]
 pub fn create_key_from_domains<H: Hasher>(
     id: &H::Domain,
     parents_data: &[H::Domain],
 ) -> Result<H::Domain> {
     let mut hasher = Sha256::new();
-    hasher.update(id.into_bytes().as_slice());
+    hasher.update(AsRef::<[u8]>::as_ref(id));
 
     for parent in parents_data.iter() {
-        hasher.update(parent.into_bytes().as_slice());
+        hasher.update(AsRef::<[u8]>::as_ref(parent));
     }
 
     let hash = hasher.finalize();
@@ -198,6 +318,47 @@ mod tests {
     #[test]
     fn encode_decode_reversed() {
         encode_decode_roundtrip(true);
+    }
+
+    #[test]
+    fn staged_key_input_matches_streaming_key_input() {
+        let nodes = 64;
+        let porep_id = [11u8; 32];
+        let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+            None,
+            nodes,
+            BASE_DEGREE,
+            EXP_DEGREE,
+            porep_id,
+            ApiVersion::V1_2_0,
+        )
+        .expect("failed to create graph");
+        let reversed = graph.zigzag();
+        let replica_id = PoseidonDomain::from([5u8; 32]);
+
+        let mut data = vec![0u8; nodes * NODE_SIZE];
+        for node in 0..nodes {
+            data[node * NODE_SIZE] = (node as u8).wrapping_mul(3).wrapping_add(1);
+            data[node * NODE_SIZE + 7] = (node as u8).wrapping_mul(19);
+        }
+
+        for graph in [&graph, &reversed] {
+            let mut parents = vec![0u32; graph.degree()];
+            let mut key_input = Vec::with_capacity(NODE_SIZE * (graph.degree() + 1));
+            for node in [0, 1, 7, nodes - 2, nodes - 1] {
+                graph.parents(node, &mut parents).expect("parents failed");
+                let streaming = create_key::<PoseidonHasher>(&replica_id, node, &parents, &data)
+                    .expect("streaming create_key failed");
+                let staged = create_key_with_staged_input::<PoseidonHasher>(
+                    &replica_id,
+                    node,
+                    &parents,
+                    &data,
+                    &mut key_input,
+                );
+                assert_eq!(staged, streaming);
+            }
+        }
     }
 
     /// ZigZag's defining performance property: extraction is *asymmetric* to replication. Encoding is

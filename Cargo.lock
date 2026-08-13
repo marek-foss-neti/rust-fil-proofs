@@ -1135,6 +1135,7 @@ dependencies = [
  "bincode",
  "blake2b_simd",
  "blstrs",
+ "cpu-time",
  "criterion",
  "ff",
  "fil_logger",

@@ -57,6 +57,8 @@ where
     pub reversed: bool,
     feistel_keys: [feistel::Index; 4],
     feistel_precomputed: FeistelPrecomputed,
+    porep_id: PoRepID,
+    api_version: ApiVersion,
     id: String,
     _h: PhantomData<H>,
 }
@@ -114,6 +116,8 @@ where
             reversed: false,
             feistel_keys,
             feistel_precomputed: feistel::precompute((expansion_degree * nodes) as feistel::Index),
+            porep_id,
+            api_version,
             _h: PhantomData,
         })
     }
@@ -138,6 +142,18 @@ where
 
     pub fn expansion_degree(&self) -> usize {
         self.expansion_degree
+    }
+
+    pub(crate) fn base_degree(&self) -> usize {
+        self.base_graph.degree()
+    }
+
+    pub(crate) fn porep_id(&self) -> PoRepID {
+        self.porep_id
+    }
+
+    pub(crate) fn api_version(&self) -> ApiVersion {
+        self.api_version
     }
 
     pub fn reversed(&self) -> bool {
@@ -328,6 +344,8 @@ where
         self.base_graph == other.base_graph
             && self.expansion_degree == other.expansion_degree
             && self.reversed == other.reversed
+            && self.porep_id == other.porep_id
+            && self.api_version == other.api_version
     }
 }
 

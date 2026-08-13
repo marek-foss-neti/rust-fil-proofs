@@ -7,6 +7,8 @@ parameter_cache = "/var/tmp/filecoin-proofs-parameters/"
 parent_cache = "/var/tmp/filecoin-parents"
 # The max number of parent cache elements to have mapped in RAM at a time.
 sdr_parents_cache_size = 2_048
+# This enables the on-disk ZigZag parent table cache.
+use_zigzag_parent_cache = true
 
 # This enables the use of the GPU for column tree building.
 use_gpu_column_builder = false

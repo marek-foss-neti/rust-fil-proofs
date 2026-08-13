@@ -41,6 +41,7 @@ file-lock = { version = "2.1.10", optional = true }
 
 [dev-dependencies]
 # Sorted alphabetically
+cpu-time.workspace = true
 criterion.workspace = true
 fil_logger.workspace = true
 rand_xorshift.workspace = true

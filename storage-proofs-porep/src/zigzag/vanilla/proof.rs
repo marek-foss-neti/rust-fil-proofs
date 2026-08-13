@@ -19,8 +19,8 @@ use crate::{
         challenges::LayerChallenges,
         graph::ZigZagBucketGraph,
         params::{
-            comm_r_star, ChallengeRequirements, PrivateInputs, PublicInputs,
-            PublicParams, SetupParams, Tau,
+            comm_r_star, ChallengeRequirements, PrivateInputs, PublicInputs, PublicParams,
+            SetupParams, Tau,
         },
         vde,
     },
@@ -71,8 +71,7 @@ pub struct Proof<Tree: MerkleTreeTrait, G: 'static + Hasher> {
     pub encoding_proofs: Vec<LayerProof<Tree>>,
     /// Layer-0 data-node inclusion proofs against the Sha256 `comm_d` tree.
     #[serde(bound = "")]
-    pub layer0_data_nodes:
-        Vec<DataProof<<BinaryMerkleTree<G> as MerkleTreeTrait>::Proof>>,
+    pub layer0_data_nodes: Vec<DataProof<<BinaryMerkleTree<G> as MerkleTreeTrait>::Proof>>,
     #[serde(bound = "")]
     pub layer_comm_rs: Vec<<Tree::Hasher as Hasher>::Domain>,
     #[serde(bound = "")]
@@ -90,14 +89,18 @@ impl<Tree: MerkleTreeTrait, G: 'static + Hasher> Clone for Proof<Tree, G> {
     }
 }
 
+type ReplicatedLayers<Tree, G> = (
+    Tau<<<Tree as MerkleTreeTrait>::Hasher as Hasher>::Domain, <G as Hasher>::Domain>,
+    BinaryMerkleTree<G>,
+    Vec<Tree>,
+);
+
 impl<Tree, G> ZigZagDrgPoRep<Tree, G>
 where
     Tree: 'static + MerkleTreeTrait,
     G: 'static + Hasher,
 {
-    pub fn transform(
-        graph: &ZigZagBucketGraph<Tree::Hasher>,
-    ) -> ZigZagBucketGraph<Tree::Hasher> {
+    pub fn transform(graph: &ZigZagBucketGraph<Tree::Hasher>) -> ZigZagBucketGraph<Tree::Hasher> {
         graph.zigzag()
     }
 
@@ -120,11 +123,7 @@ where
         replica_id: &<Tree::Hasher as Hasher>::Domain,
         data: &mut [u8],
         cache_path: Option<&Path>,
-    ) -> Result<(
-        Tau<<Tree::Hasher as Hasher>::Domain, G::Domain>,
-        BinaryMerkleTree<G>,
-        Vec<Tree>,
-    )> {
+    ) -> Result<ReplicatedLayers<Tree, G>> {
         let layers = layer_challenges.layers();
         assert!(layers > 0);
         assert_eq!(data.len() % NODE_SIZE, 0);
@@ -133,8 +132,7 @@ where
 
         let tree_d_config = cache_path.map(|p| StoreConfig::new(p, "zigzag-tree-d", 0));
         // Layer 0: Sha256 Merkle tree over the original (fr32-padded) data — this is Filecoin CommD.
-        let tree_d =
-            create_base_merkle_tree::<BinaryMerkleTree<G>>(tree_d_config, leaves, data)?;
+        let tree_d = create_base_merkle_tree::<BinaryMerkleTree<G>>(tree_d_config, leaves, data)?;
         let comm_d = tree_d.root();
 
         let mut replica_trees: Vec<Tree> = Vec::with_capacity(layers);
@@ -386,8 +384,7 @@ where
                 let replica_node = &layer_proof.replica_nodes[i];
                 let parents = &layer_proof.replica_parents[i];
 
-                if !replica_node.proof.validate(challenge) || replica_node.proof.root() != comm_r
-                {
+                if !replica_node.proof.validate(challenge) || replica_node.proof.root() != comm_r {
                     return Ok(false);
                 }
 

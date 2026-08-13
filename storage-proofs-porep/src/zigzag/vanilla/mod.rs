@@ -1,6 +1,7 @@
 mod challenges;
 mod graph;
 mod params;
+mod parent_table;
 mod proof;
 mod vde;
 
@@ -11,4 +12,4 @@ pub use params::{
     SetupParams, Tau,
 };
 pub use proof::{setup, LayerProof, Proof, ZigZagDrgPoRep};
-pub use vde::{create_key, decode, decode_block, encode};
+pub use vde::{create_key, decode, decode_block, encode, prepare_parent_table};

@@ -142,6 +142,7 @@ fn reopen_zigzag_tree<Tree: 'static + MerkleTreeTrait>(
     Ok(Tree::from_merkle(tree))
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 fn validate_zigzag_sector_data(porep_config: &PoRepConfig, data: &[u8]) -> Result<()> {
     let sector_bytes = usize::from(porep_config.padded_bytes_amount());
     ensure!(
@@ -600,6 +601,7 @@ where
 }
 
 /// Recover the original fr32-padded data from a sealed replica, in place.
+#[allow(clippy::manual_is_multiple_of)]
 pub fn zigzag_unseal<Tree: 'static + MerkleTreeTrait>(
     porep_config: &PoRepConfig,
     prover_id: ProverId,
