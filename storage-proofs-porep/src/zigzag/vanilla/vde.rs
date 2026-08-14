@@ -1,3 +1,6 @@
+use anyhow::{ensure, Context};
+use blstrs::Scalar as Fr;
+use ff::PrimeField;
 use filecoin_hashers::{Domain, Hasher};
 use fr32::bytes_into_fr_repr_safe;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
@@ -7,7 +10,7 @@ use storage_proofs_core::{
     error::Result,
     parameter_cache::ParameterSetMetadata,
     settings::SETTINGS,
-    util::{data_at_node, data_at_node_offset, NODE_SIZE},
+    util::{data_at_node_offset, NODE_SIZE},
 };
 
 use crate::encode;
@@ -18,14 +21,26 @@ const DECODE_CHUNK_NODES: usize = 16 * 1024;
 
 struct DecodeScratch {
     parents: Vec<u32>,
-    key_input: Vec<u8>,
+    key: KeyScratch,
 }
 
 impl DecodeScratch {
     fn new(degree: usize) -> Self {
         DecodeScratch {
             parents: vec![0u32; degree],
-            key_input: Vec::with_capacity(NODE_SIZE * (degree + 1)),
+            key: KeyScratch::new(degree),
+        }
+    }
+}
+
+struct KeyScratch {
+    input: Vec<u8>,
+}
+
+impl KeyScratch {
+    fn new(degree: usize) -> Self {
+        KeyScratch {
+            input: vec![0u8; NODE_SIZE * (degree + 1)],
         }
     }
 }
@@ -66,12 +81,15 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
+    ensure_graph_data_len(graph, data)?;
+
     let parent_table = if SETTINGS.use_zigzag_parent_cache {
         Some(ZigZagParentTable::new(graph)?)
     } else {
         None
     };
     let mut parents = vec![0u32; graph.degree()];
+    let mut key_scratch = KeyScratch::new(graph.degree());
     for n in 0..graph.size() {
         let node = if graph.forward() {
             n
@@ -82,13 +100,13 @@ where
 
         fill_parents(graph, parent_table.as_ref(), node, &mut parents)?;
 
-        let key = create_key::<H>(replica_id, node, &parents, data)?;
-        let start = data_at_node_offset(node);
-        let end = start + NODE_SIZE;
+        let key = create_key_with_scratch::<H>(replica_id, node, &parents, data, &mut key_scratch);
 
-        let node_data = H::Domain::try_from_bytes(&data[start..end])?;
+        let node_data = domain_at_node_unchecked::<H>(data, node);
         let encoded = encode::encode(key, node_data);
 
+        let start = data_at_node_offset(node);
+        let end = start + NODE_SIZE;
         encoded.write_bytes(&mut data[start..end])?;
     }
 
@@ -111,6 +129,8 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
+    ensure_graph_data_len(graph, data)?;
+
     let mut out = vec![0u8; data.len()];
     let parent_table = if SETTINGS.use_zigzag_parent_cache {
         Some(ZigZagParentTable::new(graph)?)
@@ -158,6 +178,14 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
+    ensure_graph_data_len(graph, data)?;
+    ensure!(
+        v < graph.size(),
+        "ZigZag decode node {} outside graph size {}",
+        v,
+        graph.size()
+    );
+
     let mut scratch = DecodeScratch::new(graph.degree());
     decode_block_with_scratch(graph, None, replica_id, data, v, &mut scratch)
 }
@@ -175,14 +203,8 @@ where
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     fill_parents(graph, parent_table, v, &mut scratch.parents)?;
-    let key = create_key_with_staged_input::<H>(
-        replica_id,
-        v,
-        &scratch.parents,
-        data,
-        &mut scratch.key_input,
-    );
-    let node_data = H::Domain::try_from_bytes(data_at_node(data, v)?)?;
+    let key = create_key_with_scratch::<H>(replica_id, v, &scratch.parents, data, &mut scratch.key);
+    let node_data = domain_at_node_unchecked::<H>(data, v);
 
     Ok(encode::decode(key, node_data))
 }
@@ -215,41 +237,69 @@ pub fn create_key<H: Hasher>(
     parents: &[u32],
     data: &[u8],
 ) -> Result<H::Domain> {
-    let mut hasher = Sha256::new();
-    hasher.update(AsRef::<[u8]>::as_ref(id));
-
-    // The hash is about the parents, hence skip if a node doesn't have any parents.
-    if node != parents[0] as usize {
-        for parent in parents.iter() {
-            let offset = data_at_node_offset(*parent as usize);
-            hasher.update(&data[offset..offset + NODE_SIZE]);
-        }
-    }
-
-    let hash = hasher.finalize();
-    Ok(bytes_into_fr_repr_safe(hash.as_ref()).into())
+    let mut scratch = KeyScratch::new(parents.len());
+    Ok(create_key_with_scratch::<H>(
+        id,
+        node,
+        parents,
+        data,
+        &mut scratch,
+    ))
 }
 
-fn create_key_with_staged_input<H: Hasher>(
+fn create_key_with_scratch<H: Hasher>(
     id: &H::Domain,
     node: usize,
     parents: &[u32],
     data: &[u8],
-    key_input: &mut Vec<u8>,
+    scratch: &mut KeyScratch,
 ) -> H::Domain {
-    key_input.clear();
-    key_input.extend_from_slice(AsRef::<[u8]>::as_ref(id));
+    debug_assert!(scratch.input.len() >= NODE_SIZE * (parents.len() + 1));
 
+    scratch.input[..NODE_SIZE].copy_from_slice(AsRef::<[u8]>::as_ref(id));
+    let mut input_len = NODE_SIZE;
     // The hash is about the parents, hence skip if a node doesn't have any parents.
     if node != parents[0] as usize {
-        for parent in parents.iter() {
+        for (index, parent) in parents.iter().enumerate() {
             let offset = data_at_node_offset(*parent as usize);
-            key_input.extend_from_slice(&data[offset..offset + NODE_SIZE]);
+            let input_offset = NODE_SIZE * (index + 1);
+            scratch.input[input_offset..input_offset + NODE_SIZE]
+                .copy_from_slice(&data[offset..offset + NODE_SIZE]);
         }
+        input_len += NODE_SIZE * parents.len();
     }
 
-    let hash = Sha256::digest(key_input.as_slice());
+    let hash = Sha256::digest(&scratch.input[..input_len]);
     bytes_into_fr_repr_safe(hash.as_ref()).into()
+}
+
+fn ensure_graph_data_len<H, G>(graph: &ZigZagGraph<H, G>, data: &[u8]) -> Result<()>
+where
+    H: Hasher,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+{
+    let expected_len = graph
+        .size()
+        .checked_mul(NODE_SIZE)
+        .context("ZigZag graph data length overflow")?;
+    ensure!(
+        data.len() == expected_len,
+        "invalid ZigZag data length: got {}, expected {}",
+        data.len(),
+        expected_len
+    );
+
+    Ok(())
+}
+
+fn domain_at_node_unchecked<H: Hasher>(data: &[u8], node: usize) -> H::Domain {
+    let offset = data_at_node_offset(node);
+    debug_assert!(offset + NODE_SIZE <= data.len());
+
+    let mut repr = <Fr as PrimeField>::Repr::default();
+    repr.as_mut()
+        .copy_from_slice(&data[offset..offset + NODE_SIZE]);
+    H::Domain::from(repr)
 }
 
 /// Recreates the encoding key from already-materialized parent domain values (used during
@@ -279,6 +329,27 @@ mod tests {
     use storage_proofs_core::{api_version::ApiVersion, drgraph::BASE_DEGREE, util::NODE_SIZE};
 
     use crate::zigzag::vanilla::graph::{ZigZagBucketGraph, EXP_DEGREE};
+
+    fn create_key_streaming_reference<H: Hasher>(
+        id: &H::Domain,
+        node: usize,
+        parents: &[u32],
+        data: &[u8],
+    ) -> H::Domain {
+        let mut hasher = Sha256::new();
+        hasher.update(AsRef::<[u8]>::as_ref(id));
+
+        // The hash is about the parents, hence skip if a node doesn't have any parents.
+        if node != parents[0] as usize {
+            for parent in parents.iter() {
+                let offset = data_at_node_offset(*parent as usize);
+                hasher.update(&data[offset..offset + NODE_SIZE]);
+            }
+        }
+
+        let hash = hasher.finalize();
+        bytes_into_fr_repr_safe(hash.as_ref()).into()
+    }
 
     fn encode_decode_roundtrip(reversed: bool) {
         let nodes = 32;
@@ -344,19 +415,27 @@ mod tests {
 
         for graph in [&graph, &reversed] {
             let mut parents = vec![0u32; graph.degree()];
-            let mut key_input = Vec::with_capacity(NODE_SIZE * (graph.degree() + 1));
+            let mut key_scratch = KeyScratch::new(graph.degree());
             for node in [0, 1, 7, nodes - 2, nodes - 1] {
                 graph.parents(node, &mut parents).expect("parents failed");
-                let streaming = create_key::<PoseidonHasher>(&replica_id, node, &parents, &data)
-                    .expect("streaming create_key failed");
-                let staged = create_key_with_staged_input::<PoseidonHasher>(
+                let streaming = create_key_streaming_reference::<PoseidonHasher>(
                     &replica_id,
                     node,
                     &parents,
                     &data,
-                    &mut key_input,
+                );
+                let staged = create_key_with_scratch::<PoseidonHasher>(
+                    &replica_id,
+                    node,
+                    &parents,
+                    &data,
+                    &mut key_scratch,
                 );
                 assert_eq!(staged, streaming);
+
+                let public = create_key::<PoseidonHasher>(&replica_id, node, &parents, &data)
+                    .expect("public create_key failed");
+                assert_eq!(public, streaming);
             }
         }
     }
