@@ -31,8 +31,76 @@ lazy_static! {
 pub(crate) struct ZigZagParentTable {
     degree: usize,
     nodes: usize,
+    entry_bytes: usize,
+    window_nodes: usize,
+    cache: CacheData,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct CacheData {
     data: Mmap,
-    _file: LockedFile,
+    offset: usize,
+    len: usize,
+    file: LockedFile,
+}
+
+impl CacheData {
+    fn contains(&self, node: usize) -> bool {
+        node >= self.offset && node < self.offset + self.len
+    }
+
+    fn shift(&mut self, offset: usize, len: usize, entry_bytes: usize, path: &Path) -> Result<()> {
+        if self.offset == offset && self.len == len {
+            return Ok(());
+        }
+
+        let byte_offset = offset
+            .checked_mul(entry_bytes)
+            .context("zigzag parent table mmap offset overflow")?;
+        let byte_len = len
+            .checked_mul(entry_bytes)
+            .context("zigzag parent table mmap length overflow")?;
+
+        self.data = unsafe {
+            MmapOptions::new()
+                .offset(byte_offset as u64)
+                .len(byte_len)
+                .map(self.file.as_ref())
+                .with_context(|| {
+                    format!("could not shift zigzag parent table={}", path.display())
+                })?
+        };
+        self.offset = offset;
+        self.len = len;
+
+        Ok(())
+    }
+
+    fn open(offset: usize, len: usize, entry_bytes: usize, path: &Path) -> Result<Self> {
+        let byte_offset = offset
+            .checked_mul(entry_bytes)
+            .context("zigzag parent table mmap offset overflow")?;
+        let byte_len = len
+            .checked_mul(entry_bytes)
+            .context("zigzag parent table mmap length overflow")?;
+        let file = LockedFile::open_shared_read(path)
+            .with_context(|| format!("could not open zigzag parent table={}", path.display()))?;
+        let data = unsafe {
+            MmapOptions::new()
+                .offset(byte_offset as u64)
+                .len(byte_len)
+                .map(file.as_ref())
+                .with_context(|| format!("could not mmap zigzag parent table={}", path.display()))?
+        };
+
+        Ok(Self {
+            data,
+            offset,
+            len,
+            file,
+        })
+    }
 }
 
 impl ZigZagParentTable {
@@ -69,7 +137,7 @@ impl ZigZagParentTable {
         }
     }
 
-    pub(crate) fn read_into(&self, node: usize, parents: &mut [u32]) -> Result<()> {
+    pub(crate) fn read_into(&mut self, node: usize, parents: &mut [u32]) -> Result<()> {
         ensure!(node < self.nodes, "node {} outside parent table", node);
         ensure!(
             parents.len() >= self.degree,
@@ -78,12 +146,20 @@ impl ZigZagParentTable {
             self.degree
         );
 
-        let entry_bytes = self.entry_bytes()?;
+        if !self.cache.contains(node) {
+            let offset = (node / self.window_nodes) * self.window_nodes;
+            let len = self.window_nodes.min(self.nodes - offset);
+            self.cache
+                .shift(offset, len, self.entry_bytes, &self.path)?;
+        }
+
         let start = node
-            .checked_mul(entry_bytes)
+            .checked_sub(self.cache.offset)
+            .context("zigzag parent table window offset underflow")?
+            .checked_mul(self.entry_bytes)
             .context("zigzag parent table offset overflow")?;
-        let end = start + entry_bytes;
-        LittleEndian::read_u32_into(&self.data[start..end], &mut parents[..self.degree]);
+        let end = start + self.entry_bytes;
+        LittleEndian::read_u32_into(&self.cache.data[start..end], &mut parents[..self.degree]);
 
         Ok(())
     }
@@ -107,18 +183,24 @@ impl ZigZagParentTable {
             );
         }
 
-        info!("zigzag parent table: opening {}", path.display());
-        let data = unsafe {
-            MmapOptions::new()
-                .map(file.as_ref())
-                .with_context(|| format!("could not mmap path={}", path.display()))?
-        };
+        let degree = graph.degree();
+        let entry_bytes = entry_bytes(degree)?;
+        let window_nodes = window_nodes(graph.size(), entry_bytes);
+        let len = window_nodes.min(graph.size());
 
+        info!(
+            "zigzag parent table: opening {} with mmap window {} / {} nodes",
+            path.display(),
+            len,
+            graph.size()
+        );
         Ok(Self {
-            degree: graph.degree(),
+            degree,
             nodes: graph.size(),
-            data,
-            _file: file,
+            entry_bytes,
+            window_nodes,
+            cache: CacheData::open(0, len, entry_bytes, path)?,
+            path: path.to_path_buf(),
         })
     }
 
@@ -130,39 +212,50 @@ impl ZigZagParentTable {
         info!("zigzag parent table: generating {}", path.display());
         let cache_size = expected_cache_size(graph)?;
         let entry_bytes = entry_bytes(graph.degree())?;
+        let window_nodes = window_nodes(graph.size(), entry_bytes);
 
         with_exclusive_lock(path, |file| {
             file.as_ref()
                 .set_len(cache_size as u64)
                 .with_context(|| format!("failed to set length: {}", cache_size))?;
 
-            let mut data = unsafe {
-                MmapOptions::new()
-                    .map_mut(file.as_ref())
-                    .with_context(|| format!("could not mmap path={}", path.display()))?
-            };
+            for offset in (0..graph.size()).step_by(window_nodes) {
+                let len = window_nodes.min(graph.size() - offset);
+                let byte_offset = offset
+                    .checked_mul(entry_bytes)
+                    .context("zigzag parent table generation offset overflow")?;
+                let byte_len = len
+                    .checked_mul(entry_bytes)
+                    .context("zigzag parent table generation length overflow")?;
+                let mut data = unsafe {
+                    MmapOptions::new()
+                        .offset(byte_offset as u64)
+                        .len(byte_len)
+                        .map_mut(file.as_ref())
+                        .with_context(|| {
+                            format!("could not mmap zigzag parent table={}", path.display())
+                        })?
+                };
 
-            data.par_chunks_mut(entry_bytes)
-                .enumerate()
-                .try_for_each_init(
-                    || vec![0u32; graph.degree()],
-                    |parents, (node, entry)| -> Result<()> {
-                        graph.parents(node, parents)?;
-                        LittleEndian::write_u32_into(parents, entry);
-                        Ok(())
-                    },
-                )?;
+                data.par_chunks_mut(entry_bytes)
+                    .enumerate()
+                    .try_for_each_init(
+                        || vec![0u32; graph.degree()],
+                        |parents, (window_node, entry)| -> Result<()> {
+                            let node = offset + window_node;
+                            graph.parents(node, parents)?;
+                            LittleEndian::write_u32_into(parents, entry);
+                            Ok(())
+                        },
+                    )?;
 
-            data.flush()
-                .context("failed to flush zigzag parent table")?;
+                data.flush()
+                    .context("failed to flush zigzag parent table window")?;
+            }
             info!("zigzag parent table: written to disk");
 
             Ok(())
         })
-    }
-
-    fn entry_bytes(&self) -> Result<usize> {
-        entry_bytes(self.degree)
     }
 }
 
@@ -170,6 +263,32 @@ fn entry_bytes(degree: usize) -> Result<usize> {
     degree
         .checked_mul(NODE_BYTES)
         .context("zigzag parent table entry size overflow")
+}
+
+fn window_nodes(nodes: usize, entry_bytes: usize) -> usize {
+    let requested = (SETTINGS.zigzag_parent_cache_size as usize)
+        .max(1)
+        .min(nodes);
+    let alignment_nodes = mmap_alignment_nodes(entry_bytes);
+    if requested < alignment_nodes || nodes < alignment_nodes {
+        return nodes.min(alignment_nodes);
+    }
+
+    (requested / alignment_nodes).max(1) * alignment_nodes
+}
+
+fn mmap_alignment_nodes(entry_bytes: usize) -> usize {
+    const MMAP_ALIGNMENT_BYTES: usize = 4096;
+    MMAP_ALIGNMENT_BYTES / gcd(MMAP_ALIGNMENT_BYTES, entry_bytes)
+}
+
+fn gcd(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
+    }
+    left
 }
 
 fn expected_cache_size<H, G>(graph: &ZigZagGraph<H, G>) -> Result<usize>
@@ -232,11 +351,11 @@ mod tests {
         .expect("failed to create zigzag graph");
 
         for graph in [graph.clone(), graph.zigzag()] {
-            let table = ZigZagParentTable::new(&graph).expect("failed to create parent table");
+            let mut table = ZigZagParentTable::new(&graph).expect("failed to create parent table");
             let mut expected = vec![0u32; graph.degree()];
             let mut actual = vec![0u32; graph.degree()];
 
-            for node in 0..nodes {
+            for node in (0..nodes).chain((0..nodes).rev()) {
                 graph
                     .parents(node, &mut expected)
                     .expect("failed to calculate parents");

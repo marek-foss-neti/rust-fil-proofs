@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{anyhow, bail, ensure, Context};
 use blstrs::Scalar as Fr;
 use ff::PrimeField;
 use filecoin_hashers::{Domain, Hasher};
@@ -176,22 +176,21 @@ where
 {
     ensure_graph_data_len(graph, data)?;
 
-    let parent_table = if SETTINGS.use_zigzag_parent_cache {
-        Some(ZigZagParentTable::new(graph)?)
-    } else {
-        None
-    };
-
     if SETTINGS.zigzag_multicore_encode && graph.size() > 1 {
-        encode_multicore(graph, parent_table.as_ref(), replica_id, data)
+        encode_multicore(graph, SETTINGS.use_zigzag_parent_cache, replica_id, data)
     } else {
-        encode_sequential(graph, parent_table.as_ref(), replica_id, data)
+        let parent_table = if SETTINGS.use_zigzag_parent_cache {
+            Some(ZigZagParentTable::new(graph)?)
+        } else {
+            None
+        };
+        encode_sequential(graph, parent_table, replica_id, data)
     }
 }
 
 fn encode_sequential<H, G>(
     graph: &ZigZagGraph<H, G>,
-    parent_table: Option<&ZigZagParentTable>,
+    mut parent_table: Option<ZigZagParentTable>,
     replica_id: &H::Domain,
     data: &mut [u8],
 ) -> Result<()>
@@ -204,7 +203,7 @@ where
     for n in 0..graph.size() {
         let node = traversal_node(graph, n);
 
-        fill_parents(graph, parent_table, node, &mut parents)?;
+        fill_parents(graph, &mut parent_table, node, &mut parents)?;
 
         let key = create_key_with_scratch::<H>(replica_id, node, &parents, data, &mut key_scratch);
 
@@ -221,7 +220,7 @@ where
 
 fn encode_multicore<H, G>(
     graph: &ZigZagGraph<H, G>,
-    parent_table: Option<&ZigZagParentTable>,
+    use_parent_table: bool,
     replica_id: &H::Domain,
     data: &mut [u8],
 ) -> Result<()>
@@ -251,6 +250,11 @@ where
         let mut runners = Vec::with_capacity(producers);
         for _ in 0..producers {
             runners.push(scope.spawn(|_| {
+                let parent_table = if use_parent_table {
+                    Some(ZigZagParentTable::new(graph)?)
+                } else {
+                    None
+                };
                 encode_prefetch_runner(
                     graph,
                     parent_table,
@@ -309,34 +313,44 @@ where
     ensure_graph_data_len(graph, data)?;
 
     let mut out = vec![0u8; data.len()];
-    let parent_table = if SETTINGS.use_zigzag_parent_cache {
-        Some(ZigZagParentTable::new(graph)?)
-    } else {
-        None
-    };
-    let parent_table = parent_table.as_ref();
+    let use_parent_table = SETTINGS.use_zigzag_parent_cache;
 
     out.par_chunks_mut(DECODE_CHUNK_NODES * NODE_SIZE)
         .enumerate()
-        .try_for_each(|(chunk_index, chunk)| -> Result<()> {
-            let mut scratch = DecodeScratch::new(graph.degree());
-            let base_node = chunk_index * DECODE_CHUNK_NODES;
+        .try_for_each_init(
+            || {
+                if use_parent_table {
+                    ZigZagParentTable::new(graph).map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+            |parent_table, (chunk_index, chunk)| -> Result<()> {
+                let parent_table = match parent_table {
+                    Ok(parent_table) => parent_table,
+                    Err(err) => {
+                        bail!("failed to open ZigZag parent table for decode worker: {err}")
+                    }
+                };
+                let mut scratch = DecodeScratch::new(graph.degree());
+                let base_node = chunk_index * DECODE_CHUNK_NODES;
 
-            for (chunk_node, node_out) in chunk.chunks_mut(NODE_SIZE).enumerate() {
-                let node = base_node + chunk_node;
-                let decoded = decode_block_with_scratch(
-                    graph,
-                    parent_table,
-                    replica_id,
-                    data,
-                    node,
-                    &mut scratch,
-                )?;
-                decoded.write_bytes(node_out)?;
-            }
+                for (chunk_node, node_out) in chunk.chunks_mut(NODE_SIZE).enumerate() {
+                    let node = base_node + chunk_node;
+                    let decoded = decode_block_with_scratch(
+                        graph,
+                        replica_id,
+                        data,
+                        node,
+                        parent_table,
+                        &mut scratch,
+                    )?;
+                    decoded.write_bytes(node_out)?;
+                }
 
-            Ok(())
-        })?;
+                Ok(())
+            },
+        )?;
 
     Ok(out)
 }
@@ -364,15 +378,16 @@ where
     );
 
     let mut scratch = DecodeScratch::new(graph.degree());
-    decode_block_with_scratch(graph, None, replica_id, data, v, &mut scratch)
+    let mut parent_table = None;
+    decode_block_with_scratch(graph, replica_id, data, v, &mut parent_table, &mut scratch)
 }
 
 fn decode_block_with_scratch<H, G>(
     graph: &ZigZagGraph<H, G>,
-    parent_table: Option<&ZigZagParentTable>,
     replica_id: &H::Domain,
     data: &[u8],
     v: usize,
+    parent_table: &mut Option<ZigZagParentTable>,
     scratch: &mut DecodeScratch,
 ) -> Result<H::Domain>
 where
@@ -389,7 +404,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn encode_prefetch_runner<H, G>(
     graph: &ZigZagGraph<H, G>,
-    parent_table: Option<&ZigZagParentTable>,
+    mut parent_table: Option<ZigZagParentTable>,
     replica_id: &H::Domain,
     data: &EncodeData,
     ring: &EncodePrefetchRing,
@@ -425,7 +440,7 @@ where
 
             if let Err(err) = fill_encode_prefetch_slot(
                 graph,
-                parent_table,
+                &mut parent_table,
                 replica_id,
                 data,
                 position,
@@ -451,7 +466,7 @@ where
 
 fn fill_encode_prefetch_slot<H, G>(
     graph: &ZigZagGraph<H, G>,
-    parent_table: Option<&ZigZagParentTable>,
+    parent_table: &mut Option<ZigZagParentTable>,
     replica_id: &H::Domain,
     data: &EncodeData,
     position: usize,
@@ -550,7 +565,7 @@ fn patch_missing_parents<H: Hasher>(data: &EncodeData, slot: &mut EncodePrefetch
 
 fn fill_parents<H, G>(
     graph: &ZigZagGraph<H, G>,
-    parent_table: Option<&ZigZagParentTable>,
+    parent_table: &mut Option<ZigZagParentTable>,
     node: usize,
     parents: &mut [u32],
 ) -> Result<()>
@@ -558,7 +573,7 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
-    if let Some(parent_table) = parent_table {
+    if let Some(parent_table) = parent_table.as_mut() {
         parent_table.read_into(node, parents)
     } else {
         graph.parents(node, parents)
@@ -797,7 +812,7 @@ mod tests {
                 .expect("sequential encode failed");
 
             let mut multicore = original.clone();
-            encode_multicore::<PoseidonHasher, _>(graph, None, &replica_id, &mut multicore)
+            encode_multicore::<PoseidonHasher, _>(graph, false, &replica_id, &mut multicore)
                 .expect("multicore encode failed");
 
             assert_eq!(
