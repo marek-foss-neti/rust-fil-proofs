@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
@@ -90,6 +91,36 @@ impl EncodePrefetchSlot {
 struct EncodePrefetchRing {
     slots: Vec<UnsafeCell<EncodePrefetchSlot>>,
     lookahead: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EncodePipelineConfig {
+    lookahead: usize,
+    producers: usize,
+    stride: usize,
+}
+
+struct CancelEncodeOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for CancelEncodeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl EncodePipelineConfig {
+    fn from_settings(nodes: usize) -> Self {
+        let lookahead = SETTINGS.zigzag_multicore_encode_lookahead.max(1).min(nodes);
+
+        Self {
+            lookahead,
+            producers: SETTINGS.zigzag_multicore_encode_producers.max(1),
+            stride: SETTINGS
+                .zigzag_multicore_encode_producer_stride
+                .max(1)
+                .min(lookahead),
+        }
+    }
 }
 
 unsafe impl Sync for EncodePrefetchRing {}
@@ -228,70 +259,177 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
-    let lookahead = SETTINGS
-        .zigzag_multicore_encode_lookahead
-        .max(1)
-        .min(graph.size());
-    let producers = SETTINGS.zigzag_multicore_encode_producers.max(1);
-    let stride = SETTINGS
-        .zigzag_multicore_encode_producer_stride
-        .max(1)
-        .min(lookahead);
+    encode_multicore_with_config(
+        graph,
+        use_parent_table,
+        replica_id,
+        data,
+        EncodePipelineConfig::from_settings(graph.size()),
+        |_, _| Ok(()),
+        |_| Ok(()),
+    )
+}
+
+fn encode_multicore_with_config<H, G, F, S>(
+    graph: &ZigZagGraph<H, G>,
+    use_parent_table: bool,
+    replica_id: &H::Domain,
+    data: &mut [u8],
+    config: EncodePipelineConfig,
+    before_fill: F,
+    before_spawn: S,
+) -> Result<()>
+where
+    H: Hasher,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+    F: Fn(usize, usize) -> Result<()> + Sync,
+    S: Fn(usize) -> std::io::Result<()>,
+{
+    let lookahead = config.lookahead.max(1).min(graph.size());
+    let producers = config.producers.max(1);
+    let stride = config.stride.max(1).min(lookahead);
+
+    // Open every fallible shared resource before any producer starts. Otherwise one producer can
+    // fail while the consumer is already waiting for a position which will never be published.
+    let parent_tables = (0..producers)
+        .map(|_| {
+            if use_parent_table {
+                ZigZagParentTable::new(graph).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let ring = EncodePrefetchRing::new(graph.degree(), lookahead);
     let data = EncodeData::new(data);
     let next_work = AtomicUsize::new(0);
     let produced_count = AtomicUsize::new(0);
     let consumer_position = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    let stop = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
 
-    let scoped = crossbeam::thread::scope(|scope| -> Result<()> {
-        let mut runners = Vec::with_capacity(producers);
-        for _ in 0..producers {
-            runners.push(scope.spawn(|_| {
-                let parent_table = if use_parent_table {
-                    Some(ZigZagParentTable::new(graph)?)
-                } else {
-                    None
-                };
-                encode_prefetch_runner(
+    let scoped = catch_unwind(AssertUnwindSafe(|| {
+        crossbeam::thread::scope(|scope| -> Result<()> {
+            // This guard must live inside the scope: cancellation must precede crossbeam's implicit
+            // joins when startup returns an error or unwinds before the consumer has started.
+            let _cancel_on_exit = CancelEncodeOnDrop(&cancelled);
+            let mut runners = Vec::with_capacity(producers);
+            for (producer, parent_table) in parent_tables.into_iter().enumerate() {
+                let data = &data;
+                let ring = &ring;
+                let next_work = &next_work;
+                let produced_count = &produced_count;
+                let consumer_position = &consumer_position;
+                let cancelled = &cancelled;
+                let before_fill = &before_fill;
+                let runner = before_spawn(producer)
+                    .and_then(|()| {
+                        scope.builder().spawn(move |_| {
+                            let result = catch_unwind(AssertUnwindSafe(|| {
+                                encode_prefetch_runner(
+                                    producer,
+                                    &before_fill,
+                                    graph,
+                                    parent_table,
+                                    replica_id,
+                                    data,
+                                    ring,
+                                    next_work,
+                                    produced_count,
+                                    consumer_position,
+                                    cancelled,
+                                    stride,
+                                )
+                            }));
+
+                            match result {
+                                Ok(result) => {
+                                    if result.is_err() {
+                                        cancelled.store(true, Ordering::Release);
+                                    }
+                                    result
+                                }
+                                Err(payload) => {
+                                    cancelled.store(true, Ordering::Release);
+                                    Err(anyhow!(
+                                        "zigzag multicore encode producer {producer} panicked: {}",
+                                        panic_message(payload.as_ref())
+                                    ))
+                                }
+                            }
+                        })
+                    })
+                    .with_context(|| {
+                        format!("failed to spawn zigzag multicore encode producer {producer}")
+                    })?;
+                runners.push(runner);
+            }
+
+            let consumer_result = catch_unwind(AssertUnwindSafe(|| {
+                encode_prefetch_consumer::<H, G>(
                     graph,
-                    parent_table,
-                    replica_id,
                     &data,
                     &ring,
-                    &next_work,
                     &produced_count,
                     &consumer_position,
-                    &failed,
-                    &stop,
-                    stride,
+                    &cancelled,
                 )
-            }));
-        }
+            }))
+            .map_err(|payload| {
+                anyhow!(
+                    "zigzag multicore encode consumer panicked: {}",
+                    panic_message(payload.as_ref())
+                )
+            })
+            .and_then(|result| result);
+            cancelled.store(true, Ordering::Release);
 
-        let consumer_result = encode_prefetch_consumer::<H, G>(
-            graph,
-            &data,
-            &ring,
-            &produced_count,
-            &consumer_position,
-            &failed,
-        );
-        stop.store(true, Ordering::Release);
+            let mut producer_error = None;
+            for runner in runners {
+                let result = runner.join().map_err(|payload| {
+                    anyhow!(
+                        "zigzag multicore encode producer panicked: {}",
+                        panic_message(payload.as_ref())
+                    )
+                })?;
+                if let Err(err) = result {
+                    if producer_error.is_none() {
+                        producer_error = Some(err);
+                    }
+                }
+            }
 
-        for runner in runners {
-            runner
-                .join()
-                .map_err(|_| anyhow!("zigzag multicore encode producer panicked"))??;
-        }
-
-        consumer_result
-    })
-    .map_err(|_| anyhow!("zigzag multicore encode scope panicked"))?;
+            if let Some(err) = producer_error {
+                Err(err)
+            } else {
+                consumer_result
+            }
+        })
+    }))
+    .map_err(|payload| {
+        anyhow!(
+            "zigzag multicore encode scope panicked: {}",
+            panic_message(payload.as_ref())
+        )
+    })?
+    .map_err(|payload| {
+        anyhow!(
+            "zigzag multicore encode scope panicked: {}",
+            panic_message(payload.as_ref())
+        )
+    })?;
 
     scoped
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    }
 }
 
 /// Decodes (extracts) all of `data`, returning the original pre-encoding bytes.
@@ -403,6 +541,8 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn encode_prefetch_runner<H, G>(
+    producer: usize,
+    before_fill: &impl Fn(usize, usize) -> Result<()>,
     graph: &ZigZagGraph<H, G>,
     mut parent_table: Option<ZigZagParentTable>,
     replica_id: &H::Domain,
@@ -411,8 +551,7 @@ fn encode_prefetch_runner<H, G>(
     next_work: &AtomicUsize,
     produced_count: &AtomicUsize,
     consumer_position: &AtomicUsize,
-    failed: &AtomicBool,
-    stop: &AtomicBool,
+    cancelled: &AtomicBool,
     stride: usize,
 ) -> Result<()>
 where
@@ -420,7 +559,7 @@ where
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     loop {
-        if stop.load(Ordering::Acquire) {
+        if cancelled.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -432,13 +571,14 @@ where
 
         for position in work..work + count {
             while position >= consumer_position.load(Ordering::Acquire) + ring.lookahead {
-                if stop.load(Ordering::Acquire) {
+                if cancelled.load(Ordering::Acquire) {
                     return Ok(());
                 }
                 thread::yield_now();
             }
 
-            if let Err(err) = fill_encode_prefetch_slot(
+            before_fill(producer, position)?;
+            fill_encode_prefetch_slot(
                 graph,
                 &mut parent_table,
                 replica_id,
@@ -448,14 +588,11 @@ where
                 // Safety: the ring protocol ensures a slot is written by at most one producer before
                 // the consumer reads it, and is not reused until `consumer_position` advances.
                 unsafe { ring.slot_mut(position) },
-            ) {
-                failed.store(true, Ordering::Release);
-                return Err(err);
-            }
+            )?;
         }
 
         while produced_count.load(Ordering::Acquire) != work {
-            if stop.load(Ordering::Acquire) {
+            if cancelled.load(Ordering::Acquire) {
                 return Ok(());
             }
             thread::yield_now();
@@ -511,7 +648,7 @@ fn encode_prefetch_consumer<H, G>(
     ring: &EncodePrefetchRing,
     produced_count: &AtomicUsize,
     consumer_position: &AtomicUsize,
-    failed: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Result<()>
 where
     H: Hasher,
@@ -519,8 +656,8 @@ where
 {
     for position in 0..graph.size() {
         while produced_count.load(Ordering::Acquire) <= position {
-            if failed.load(Ordering::Acquire) {
-                return Err(anyhow!("zigzag multicore encode producer failed"));
+            if cancelled.load(Ordering::Acquire) {
+                return Err(anyhow!("zigzag multicore encode pipeline cancelled"));
             }
             thread::yield_now();
         }
@@ -529,7 +666,7 @@ where
         // Safety: the slot is ready because `produced_count > position`, and it cannot be reused
         // until this loop advances `consumer_position` after writing the encoded node.
         let slot = unsafe { ring.slot_mut(position) };
-        patch_missing_parents::<H>(data, slot);
+        patch_missing_parents(data, slot);
 
         let key = create_key_from_staged_input::<H>(&slot.key_input[..slot.input_len]);
         let node_data = domain_from_node_bytes_unchecked::<H>(
@@ -547,7 +684,7 @@ where
     Ok(())
 }
 
-fn patch_missing_parents<H: Hasher>(data: &EncodeData, slot: &mut EncodePrefetchSlot) {
+fn patch_missing_parents(data: &EncodeData, slot: &mut EncodePrefetchSlot) {
     if slot.input_len == NODE_SIZE {
         return;
     }
@@ -718,6 +855,9 @@ pub fn create_key_from_domains<H: Hasher>(
 mod tests {
     use super::*;
 
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use filecoin_hashers::poseidon::{PoseidonDomain, PoseidonHasher};
     use storage_proofs_core::{api_version::ApiVersion, drgraph::BASE_DEGREE, util::NODE_SIZE};
 
@@ -822,6 +962,171 @@ mod tests {
                 graph.reversed()
             );
         }
+    }
+
+    #[test]
+    fn multicore_pipeline_wraps_ring_with_different_producer_counts() {
+        let nodes = 128;
+        let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+            None,
+            nodes,
+            BASE_DEGREE,
+            EXP_DEGREE,
+            [20u8; 32],
+            ApiVersion::V1_2_0,
+        )
+        .expect("failed to create graph");
+        let reversed = graph.zigzag();
+        let replica_id = PoseidonDomain::from([12u8; 32]);
+        let mut original = vec![0u8; nodes * NODE_SIZE];
+        for node in 0..nodes {
+            original[node * NODE_SIZE] = (node as u8).wrapping_mul(11).wrapping_add(1);
+        }
+
+        for graph in [&graph, &reversed] {
+            let mut sequential = original.clone();
+            encode_sequential::<PoseidonHasher, _>(graph, None, &replica_id, &mut sequential)
+                .expect("sequential encode failed");
+
+            for producers in [1, 2, 4] {
+                let mut multicore = original.clone();
+                encode_multicore_with_config::<PoseidonHasher, _, _, _>(
+                    graph,
+                    false,
+                    &replica_id,
+                    &mut multicore,
+                    EncodePipelineConfig {
+                        lookahead: 4,
+                        producers,
+                        stride: 2,
+                    },
+                    |_, _| Ok(()),
+                    |_| Ok(()),
+                )
+                .expect("multicore encode failed");
+                assert_eq!(
+                    multicore,
+                    sequential,
+                    "pipeline diverged with producers={producers} reversed={}",
+                    graph.reversed()
+                );
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum PipelineFault {
+        ProducerError,
+        ProducerPanic,
+        SpawnError,
+        SpawnPanic,
+    }
+
+    fn pipeline_fault_result(fault: PipelineFault) -> String {
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let nodes = 128;
+            let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+                None,
+                nodes,
+                BASE_DEGREE,
+                EXP_DEGREE,
+                [21u8; 32],
+                ApiVersion::V1_2_0,
+            )
+            .expect("failed to create graph");
+            let replica_id = PoseidonDomain::from([12u8; 32]);
+            let mut data = vec![0u8; nodes * NODE_SIZE];
+            let (started_sender, started_receiver) = mpsc::channel();
+            let startup_fault =
+                matches!(fault, PipelineFault::SpawnError | PipelineFault::SpawnPanic);
+            let result = encode_multicore_with_config::<PoseidonHasher, _, _, _>(
+                &graph,
+                false,
+                &replica_id,
+                &mut data,
+                EncodePipelineConfig {
+                    lookahead: 4,
+                    producers: 3,
+                    stride: 2,
+                },
+                |_, position| {
+                    if startup_fault && position == 3 {
+                        started_sender
+                            .send(())
+                            .expect("failed to report producer progress");
+                    }
+                    if position == 8 {
+                        match fault {
+                            PipelineFault::ProducerPanic => panic!("forced producer panic"),
+                            PipelineFault::ProducerError => bail!("forced producer error"),
+                            _ => {}
+                        }
+                    }
+                    Ok(())
+                },
+                |producer| {
+                    if startup_fault && producer == 1 {
+                        // The first worker has filled the ring and cannot finish without either
+                        // the consumer or cancellation. Fail before starting the second worker.
+                        started_receiver
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("first producer did not fill the ring");
+                        if matches!(fault, PipelineFault::SpawnPanic) {
+                            panic!("forced spawn panic");
+                        }
+                        return Err(std::io::Error::other("forced spawn error"));
+                    }
+                    Ok(())
+                },
+            );
+            if startup_fault {
+                assert!(
+                    data.iter().all(|byte| *byte == 0),
+                    "consumer ran after failed startup"
+                );
+            }
+            sender
+                .send(result.map_err(|err| format!("{err:#}")))
+                .expect("failed to send pipeline result");
+        });
+
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pipeline hung after injected failure");
+        handle.join().expect("pipeline test thread panicked");
+        result.expect_err("fault injection unexpectedly succeeded")
+    }
+
+    #[test]
+    fn multicore_pipeline_cancels_after_producer_error() {
+        let error = pipeline_fault_result(PipelineFault::ProducerError);
+        assert!(error.contains("forced producer error"), "{}", error);
+    }
+
+    #[test]
+    fn multicore_pipeline_cancels_after_producer_panic() {
+        let error = pipeline_fault_result(PipelineFault::ProducerPanic);
+        assert!(error.contains("forced producer panic"), "{}", error);
+        assert!(error.contains("panicked"), "{}", error);
+    }
+
+    #[test]
+    fn multicore_pipeline_cancels_after_spawn_error() {
+        let error = pipeline_fault_result(PipelineFault::SpawnError);
+        assert!(
+            error.contains("failed to spawn zigzag multicore encode producer 1"),
+            "{}",
+            error
+        );
+        assert!(error.contains("forced spawn error"), "{}", error);
+    }
+
+    #[test]
+    fn multicore_pipeline_cancels_after_spawn_panic() {
+        let error = pipeline_fault_result(PipelineFault::SpawnPanic);
+        assert!(error.contains("forced spawn panic"), "{}", error);
+        assert!(error.contains("scope panicked"), "{}", error);
     }
 
     #[test]
