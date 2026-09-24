@@ -15,6 +15,8 @@ pub mod param;
 pub mod parameters;
 pub mod pieces;
 pub mod types;
+#[cfg(feature = "zigzag-bench")]
+pub mod zigzag_bench;
 
 mod api;
 mod commitment_reader;

@@ -50,6 +50,7 @@ walkdir = "2.3.2"
 
 [features]
 default = ["opencl"]
+zigzag-bench = []
 cpu-profile = ["gperftools"]
 heap-profile = ["gperftools/heap"]
 simd = ["storage-proofs-core/simd"]

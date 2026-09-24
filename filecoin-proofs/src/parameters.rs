@@ -126,6 +126,12 @@ pub fn zigzag_setup_params(porep_config: &PoRepConfig) -> Result<zigzag::SetupPa
         .expect("LAYERS poisoned")
         .get(&u64::from(sector_bytes))
         .expect("unknown sector size");
+    #[cfg(feature = "zigzag-bench")]
+    let num_layers = if crate::zigzag_bench::is_config(porep_config) {
+        crate::zigzag_bench::LAYERS
+    } else {
+        num_layers
+    };
 
     let sector_bytes = u64::from(sector_bytes);
     ensure!(

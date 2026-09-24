@@ -137,6 +137,10 @@ impl PoRepConfig {
     }
 
     pub fn minimum_challenges(&self) -> usize {
+        #[cfg(feature = "zigzag-bench")]
+        if crate::zigzag_bench::is_config(self) {
+            return crate::zigzag_bench::MINIMUM_CHALLENGES;
+        }
         if self.feature_enabled(ApiFeature::NonInteractivePoRep) {
             constants::get_porep_non_interactive_minimum_challenges(u64::from(self.sector_size))
         } else {
