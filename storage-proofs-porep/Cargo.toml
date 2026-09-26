@@ -16,6 +16,7 @@ storage-proofs-core.workspace = true
 # Sorted alphabetically
 anyhow.workspace = true
 bellperson.workspace = true
+bellpepper-core = "0.2.1"
 bincode.workspace = true
 blake2b_simd.workspace = true
 blake2s_simd.workspace = true
@@ -24,10 +25,12 @@ byte-slice-cast.workspace = true
 byteorder.workspace = true
 chacha20 = "0.9.0"
 crossbeam = "0.8"
+ec-gpu-gen = "0.7.1"
 fdlimit.workspace = true
 ff.workspace = true
 fs2 = "0.4"
 generic-array.workspace = true
+group = "0.13.0"
 glob = "0.3.0"
 hex.workspace = true
 hwloc = { version = "2.2.0", optional = true, package = "hwloc2" }
@@ -40,10 +43,13 @@ neptune.workspace = true
 num-bigint = "0.4.3"
 num-traits = "0.2"
 num_cpus.workspace = true
+pairing = "0.23.0"
 pretty_assertions.workspace = true
 rayon.workspace = true
+rand_core = "0.6.4"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tempfile.workspace = true
 yastl = "0.1.2"
 
 [build-dependencies]
