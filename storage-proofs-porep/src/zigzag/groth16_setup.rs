@@ -46,7 +46,7 @@ impl SetupLimits {
             }
         }
         let batch_points = read("FIL_PROOFS_ZIGZAG_SETUP_BATCH_POINTS", 65_536)?;
-        let workers = read("FIL_PROOFS_ZIGZAG_SETUP_WORKERS", 2)?;
+        let workers = read("FIL_PROOFS_ZIGZAG_SETUP_WORKERS", 16)?;
         let budget_bytes = read("FIL_PROOFS_ZIGZAG_SETUP_BUDGET_BYTES", 100_000_000_000)?;
         anyhow::ensure!(
             batch_points > 0 && batch_points <= usize::MAX as u64,
