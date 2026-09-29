@@ -18,7 +18,8 @@ use filecoin_proofs::types::{
     PaddedBytesAmount, PieceInfo, PoRepConfig, UnpaddedByteIndex, UnpaddedBytesAmount,
 };
 use filecoin_proofs::{
-    add_piece, zigzag_comm_r_bound, zigzag_load_aux, zigzag_pre_commit, zigzag_pre_commit_phase1,
+    add_piece, zigzag_comm_r_bound, zigzag_commit_phase1_from_cache, zigzag_commit_phase2,
+    zigzag_load_aux, zigzag_pre_commit, zigzag_pre_commit_phase1,
     zigzag_pre_commit_phase1_with_replica_id, zigzag_pre_commit_phase2, zigzag_prove,
     zigzag_prove_from_cache, zigzag_unseal, zigzag_unseal_range, zigzag_verify_seal,
 };
@@ -513,4 +514,81 @@ fn test_zigzag_seal_lifecycle_2kib() {
 #[ignore = "generates Groth16 parameters and proves from disk-backed ZigZag trees; slow"]
 fn test_zigzag_cached_seal_lifecycle_2kib() {
     zigzag_cached_seal_lifecycle(SECTOR_SIZE_2_KIB);
+}
+
+// These two tests are intentionally run in separate remote containers. The
+// serialized C1 artifact and parameter cache are mounted into the C2 process.
+#[test]
+#[ignore = "remote-only stage 3 fixture: generates parameters and disk-backed vanilla proofs"]
+fn stage3_prepare_ten_partition_c1() {
+    let root = PathBuf::from(std::env::var("ZIGZAG_STAGE3_FIXTURE_ROOT").expect("fixture root"));
+    let params = root.join("params");
+    let cache = root.join("seal-cache");
+    std::fs::create_dir_all(&params).expect("param cache");
+    std::fs::create_dir_all(&cache).expect("seal cache");
+    std::env::set_var("FIL_PROOFS_PARAMETER_CACHE", &params);
+    let mut config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, POREP_ID, ApiVersion::V1_2_0);
+    config.partitions = filecoin_proofs::types::PoRepProofPartitions(10);
+    generate_zigzag_params(&config);
+    let (mut data, piece_infos) = stage_sector(SECTOR_SIZE_2_KIB);
+    let (precommit, state) = zigzag_pre_commit_phase1::<ZigZagTree>(
+        &config,
+        &cache,
+        PROVER_ID,
+        SectorId::from(1),
+        TICKET,
+        &mut data,
+        &piece_infos,
+    )
+    .expect("precommit");
+    drop(state);
+    let c1 = zigzag_commit_phase1_from_cache::<ZigZagTree>(
+        &config,
+        &cache,
+        precommit.comm_d,
+        precommit.comm_r,
+        precommit.comm_r_star,
+        PROVER_ID,
+        SectorId::from(1),
+        TICKET,
+        Some(SEED),
+    )
+    .expect("C1 vanilla proofs");
+    assert_eq!(c1.vanilla_proofs.len(), 10);
+    std::fs::write(
+        root.join("c1.json"),
+        serde_json::to_vec(&c1).expect("serialize C1"),
+    )
+    .expect("save C1");
+}
+
+#[test]
+#[ignore = "remote-only stage 3 C2: reads serialized vanilla proofs in a fresh process"]
+fn stage3_prove_serialized_ten_partitions() {
+    let root = PathBuf::from(std::env::var("ZIGZAG_STAGE3_FIXTURE_ROOT").expect("fixture root"));
+    std::env::set_var("FIL_PROOFS_PARAMETER_CACHE", root.join("params"));
+    let mut config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, POREP_ID, ApiVersion::V1_2_0);
+    config.partitions = filecoin_proofs::types::PoRepProofPartitions(10);
+    let c1: filecoin_proofs::ZigZagCommitPhase1Output<ZigZagTree> =
+        serde_json::from_slice(&std::fs::read(root.join("c1.json")).expect("read C1"))
+            .expect("deserialize C1");
+    let wrong_c1: filecoin_proofs::ZigZagCommitPhase1Output<ZigZagTree> =
+        serde_json::from_slice(&std::fs::read(root.join("c1.json")).unwrap()).unwrap();
+    assert!(zigzag_commit_phase2(&config, wrong_c1, PROVER_ID, SectorId::from(2)).is_err());
+    let (comm_d, comm_r, comm_r_star) = (c1.comm_d, c1.comm_r, c1.comm_r_star);
+    let proof =
+        zigzag_commit_phase2(&config, c1, PROVER_ID, SectorId::from(1)).expect("C2 Groth16 proofs");
+    assert_eq!(proof.proof.len(), 192 * 10);
+    assert!(zigzag_verify_seal::<ZigZagTree>(
+        &config,
+        comm_r,
+        comm_d,
+        comm_r_star,
+        PROVER_ID,
+        SectorId::from(1),
+        TICKET,
+        Some(SEED),
+        &proof.proof,
+    )
+    .expect("verify all partitions"));
 }

@@ -1,17 +1,22 @@
 use std::marker::PhantomData;
 use std::{
+    convert::TryFrom,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     time::Instant,
 };
 
-use anyhow::{bail, Context};
-use bellperson::{groth16, Circuit};
+use anyhow::{bail, ensure, Context};
+use bellperson::{
+    groth16::{self, create_random_proof_batch, create_random_proof_batch_in_priority},
+    Circuit,
+};
 use blstrs::{Bls12, Scalar as Fr};
 use filecoin_hashers::Hasher;
 use fs2::FileExt;
 use group::prime::PrimeCurveAffine;
-use rand_core::RngCore;
+use rand_core::{OsRng, RngCore};
+use rayon::prelude::*;
 use storage_proofs_core::{
     compound_proof::{CircuitComponent, CompoundProof},
     drgraph::Graph,
@@ -19,6 +24,7 @@ use storage_proofs_core::{
     merkle::MerkleTreeTrait,
     parameter_cache::{self, Bls12GrothParams, CacheableParameters, ParameterSetMetadata},
     proof::ProofScheme,
+    util::NODE_SIZE,
 };
 
 use crate::zigzag::{
@@ -96,7 +102,37 @@ fn preflight_parameter_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Returns the batch size selected by the ZigZag prover for a sector.
+pub fn groth16_batch_size_for_sector_size(sector_size_bytes: u64) -> Result<usize> {
+    const MAX_ZIGZAG_BATCH_SIZE: usize = 10;
+    // Bound large circuits to one at a time unless explicitly configured.
+    let default_size = if sector_size_bytes >= 512 * 1024 * 1024 {
+        1
+    } else {
+        2
+    };
+    match std::env::var("FIL_PROOFS_ZIGZAG_GROTH16_BATCH_SIZE") {
+        Ok(value) => {
+            let size: usize = value.parse().context("invalid ZigZag Groth16 batch size")?;
+            ensure!(
+                (1..=MAX_ZIGZAG_BATCH_SIZE).contains(&size),
+                "ZigZag Groth16 batch size must be between 1 and 10"
+            );
+            Ok(size)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default_size),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl<Tree: MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, G> {
+    fn groth16_batch_size(pub_params: &PublicParams<Tree>) -> Result<usize> {
+        let sector_size_bytes = u64::try_from(pub_params.graph.size())?
+            .checked_mul(NODE_SIZE as u64)
+            .context("ZigZag sector size overflow")?;
+        groth16_batch_size_for_sector_size(sector_size_bytes)
+    }
+
     /// Reads the VK prefix of a validated parameter file without depending on
     /// the in-memory representation selected by the Groth16 backend.
     pub fn read_parameter_verifying_key(
@@ -321,6 +357,50 @@ where
     Tree: 'static + MerkleTreeTrait,
     G: 'static + Hasher,
 {
+    fn circuit_proofs(
+        pub_in: &PublicInputs<<Tree::Hasher as Hasher>::Domain, G::Domain>,
+        vanilla_proofs: Vec<<ZigZagDrgPoRep<Tree, G> as ProofScheme<'a>>::Proof>,
+        pub_params: &PublicParams<Tree>,
+        groth_params: &Bls12GrothParams,
+        priority: bool,
+    ) -> Result<Vec<groth16::Proof<Bls12>>> {
+        ensure!(!vanilla_proofs.is_empty(), "missing ZigZag vanilla proofs");
+        let batch_size = Self::groth16_batch_size(pub_params)?;
+        let proof_count = vanilla_proofs.len();
+        let mut result = Vec::with_capacity(proof_count);
+        let create = if priority {
+            create_random_proof_batch_in_priority
+        } else {
+            create_random_proof_batch
+        };
+        let mut rng = OsRng;
+        let mut partitions = vanilla_proofs.into_iter().enumerate();
+        while result.len() < proof_count {
+            let batch: Vec<_> = partitions
+                .by_ref()
+                .take(batch_size)
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(k, vanilla)| {
+                    Self::circuit(pub_in, Default::default(), &vanilla, pub_params, Some(k))
+                })
+                .collect::<Result<_>>()?;
+            let batch_len = batch.len();
+            ensure!(batch_len > 0, "missing ZigZag circuits for next batch");
+            let proofs = create(batch, groth_params, &mut rng)?;
+            ensure!(
+                proofs.len() == batch_len,
+                "ZigZag Groth16 proof count differs from circuit batch"
+            );
+            for proof in proofs {
+                let mut bytes = Vec::new();
+                proof.write(&mut bytes)?;
+                result.push(groth16::Proof::<Bls12>::read(&bytes[..])?);
+            }
+        }
+        Ok(result)
+    }
+
     fn generate_public_inputs(
         pub_in: &PublicInputs<<Tree::Hasher as Hasher>::Domain, G::Domain>,
         pub_params: &PublicParams<Tree>,

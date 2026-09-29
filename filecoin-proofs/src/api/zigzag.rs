@@ -30,6 +30,7 @@ use storage_proofs_core::{
     drgraph::Graph,
     merkle::{create_base_merkle_tree, BinaryMerkleTree, MerkleTreeTrait, Store},
     multi_proof::MultiProof,
+    proof::ProofScheme,
     sector::SectorId,
     util::NODE_SIZE,
 };
@@ -98,6 +99,26 @@ pub struct ZigZagAux {
     pub comm_r_star: Commitment,
     pub replica_id: Commitment,
     pub layers: usize,
+}
+
+/// Durable C1 result. It contains no tree handles or parameter mapping, so C2 may
+/// run after the C1 process exits and the Merkle stores have been released.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct ZigZagCommitPhase1Output<Tree: MerkleTreeTrait> {
+    pub vanilla_proofs: Vec<storage_proofs_porep::zigzag::Proof<Tree, DefaultPieceHasher>>,
+    pub comm_d: Commitment,
+    pub comm_r: Commitment,
+    pub comm_r_star: Commitment,
+    pub layer_comm_rs: Vec<Commitment>,
+    pub replica_id: Commitment,
+    pub prover_id: ProverId,
+    pub sector_id: u64,
+    pub ticket: Ticket,
+    pub seed: Option<Ticket>,
+    pub sector_size: u64,
+    pub porep_id: [u8; 32],
+    pub partitions: usize,
 }
 
 const ZIGZAG_AUX_FILE: &str = "zigzag-aux.json";
@@ -369,6 +390,37 @@ pub fn zigzag_prove_from_cache<Tree: 'static + MerkleTreeTrait>(
 where
     TreeDomain<Tree>: From<blstrs::Scalar>,
 {
+    let phase1 = zigzag_commit_phase1_from_cache::<Tree>(
+        porep_config,
+        cache_path,
+        comm_d_in,
+        comm_r_in,
+        comm_r_star_in,
+        prover_id,
+        sector_id,
+        ticket,
+        seed,
+    )?;
+    zigzag_commit_phase2(porep_config, phase1, prover_id, sector_id)
+}
+
+/// Open and validate the persisted Merkle stores, then create and verify only
+/// vanilla proofs. No Groth16 parameters are opened in this phase.
+#[allow(clippy::too_many_arguments)]
+pub fn zigzag_commit_phase1_from_cache<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
+    cache_path: impl AsRef<Path>,
+    comm_d_in: Commitment,
+    comm_r_in: Commitment,
+    comm_r_star_in: Commitment,
+    prover_id: ProverId,
+    sector_id: SectorId,
+    ticket: Ticket,
+    seed: Option<Ticket>,
+) -> Result<ZigZagCommitPhase1Output<Tree>>
+where
+    TreeDomain<Tree>: From<blstrs::Scalar>,
+{
     let cache_path = cache_path.as_ref();
     let aux = zigzag_load_aux(cache_path)?;
 
@@ -466,7 +518,171 @@ where
         trees,
     };
 
-    zigzag_prove::<Tree>(porep_config, state, seed)
+    let compound_setup_params = compound_proof::SetupParams {
+        vanilla_params: zigzag_setup_params(porep_config)?,
+        partitions: Some(usize::from(porep_config.partitions)),
+        priority: false,
+    };
+    let compound_public_params =
+        ZigZagCompound::<Tree, DefaultPieceHasher>::setup(&compound_setup_params)?;
+    let public_inputs = PublicInputs {
+        replica_id: state.replica_id,
+        seed: seed.map(challenge_seed_from_randomness::<Tree>),
+        tau: Some(state.tau.simplify()),
+        comm_r_star: state.tau.comm_r_star,
+        k: None,
+    };
+    let private_inputs = PrivateInputs::<Tree, DefaultPieceHasher> {
+        tree_d: state.tree_d,
+        aux: state.trees,
+        layer_comm_rs: state.tau.layer_comm_rs.clone(),
+        comm_d: state.tau.comm_d,
+    };
+    let partitions =
+        ZigZagCompound::<Tree, DefaultPieceHasher>::partition_count(&compound_public_params);
+    let vanilla_proofs = ZigZagDrgPoRep::<Tree, DefaultPieceHasher>::prove_all_partitions(
+        &compound_public_params.vanilla_params,
+        &public_inputs,
+        &private_inputs,
+        partitions,
+    )?;
+    ensure!(
+        ZigZagDrgPoRep::<Tree, DefaultPieceHasher>::verify_all_partitions(
+            &compound_public_params.vanilla_params,
+            &public_inputs,
+            &vanilla_proofs,
+        )?,
+        "invalid ZigZag vanilla proofs"
+    );
+    // Close all Merkle stores before returning the serializable C1 result.
+    drop(private_inputs);
+    Ok(ZigZagCommitPhase1Output {
+        vanilla_proofs,
+        comm_d: comm_d_in,
+        comm_r: comm_r_in,
+        comm_r_star: comm_r_star_in,
+        layer_comm_rs: state
+            .tau
+            .layer_comm_rs
+            .into_iter()
+            .map(commitment_from_domain)
+            .collect(),
+        replica_id: commitment_from_domain(state.replica_id),
+        prover_id,
+        sector_id: sector_id.into(),
+        ticket,
+        seed,
+        sector_size: u64::from(porep_config.padded_bytes_amount()),
+        porep_id: porep_config.porep_id,
+        partitions,
+    })
+}
+
+/// Create Groth16 proofs from a serialized C1 result, without the sector cache.
+pub fn zigzag_commit_phase2<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
+    phase1: ZigZagCommitPhase1Output<Tree>,
+    prover_id: ProverId,
+    sector_id: SectorId,
+) -> Result<SealCommitOutput>
+where
+    TreeDomain<Tree>: From<blstrs::Scalar>,
+{
+    ensure!(
+        phase1.prover_id == prover_id,
+        "ZigZag C1 prover ID mismatch"
+    );
+    ensure!(
+        phase1.sector_id == u64::from(sector_id),
+        "ZigZag C1 sector ID mismatch"
+    );
+    ensure!(
+        phase1.sector_size == u64::from(porep_config.padded_bytes_amount()),
+        "ZigZag C1 sector size mismatch"
+    );
+    ensure!(
+        phase1.porep_id == porep_config.porep_id,
+        "ZigZag C1 PoRep ID mismatch"
+    );
+    ensure!(
+        phase1.partitions == usize::from(porep_config.partitions),
+        "ZigZag C1 partition count mismatch"
+    );
+    ensure!(
+        phase1.vanilla_proofs.len() == phase1.partitions,
+        "ZigZag C1 proof count mismatch"
+    );
+    ensure!(
+        !phase1.layer_comm_rs.is_empty(),
+        "ZigZag C1 has no layer roots"
+    );
+    ensure!(
+        phase1.layer_comm_rs.last() == Some(&phase1.comm_r),
+        "ZigZag C1 final root mismatch"
+    );
+    let comm_d: DefaultPieceDomain = as_safe_commitment(&phase1.comm_d, "comm_d")?;
+    let replica_id = generate_replica_id::<Tree::Hasher, _>(
+        &prover_id,
+        sector_id.into(),
+        &phase1.ticket,
+        phase1.comm_d,
+        &porep_config.porep_id,
+    );
+    ensure!(
+        commitment_from_domain(replica_id) == phase1.replica_id,
+        "ZigZag C1 replica ID mismatch"
+    );
+    let layer_comm_rs = phase1
+        .layer_comm_rs
+        .iter()
+        .map(|root| as_safe_commitment::<TreeDomain<Tree>, _>(root, "layer root"))
+        .collect::<Result<Vec<_>>>()?;
+    let computed_comm_r_star = comm_r_star::<Tree::Hasher>(&replica_id, &layer_comm_rs)?;
+    ensure!(
+        commitment_from_domain(computed_comm_r_star) == phase1.comm_r_star,
+        "ZigZag C1 comm_r_star mismatch"
+    );
+    let public_inputs = PublicInputs {
+        replica_id,
+        seed: phase1.seed.map(challenge_seed_from_randomness::<Tree>),
+        tau: Some(LayerTau::new(
+            comm_d,
+            *layer_comm_rs.last().expect("checked roots"),
+        )),
+        comm_r_star: computed_comm_r_star,
+        k: None,
+    };
+    let setup = compound_proof::SetupParams {
+        vanilla_params: zigzag_setup_params(porep_config)?,
+        partitions: Some(phase1.partitions),
+        priority: false,
+    };
+    let params = ZigZagCompound::<Tree, DefaultPieceHasher>::setup(&setup)?;
+    ensure!(
+        params.vanilla_params.layer_challenges.layers() == layer_comm_rs.len(),
+        "ZigZag C1 layer count mismatch"
+    );
+    ensure!(
+        ZigZagDrgPoRep::<Tree, DefaultPieceHasher>::verify_all_partitions(
+            &params.vanilla_params,
+            &public_inputs,
+            &phase1.vanilla_proofs,
+        )?,
+        "invalid serialized ZigZag vanilla proofs"
+    );
+    let groth_params = get_zigzag_params::<Tree>(porep_config)?;
+    let proofs = ZigZagCompound::<Tree, DefaultPieceHasher>::circuit_proofs(
+        &public_inputs,
+        phase1.vanilla_proofs,
+        &params.vanilla_params,
+        &groth_params,
+        params.priority,
+    )?;
+    let verifying_key = get_zigzag_verifying_key::<Tree>(porep_config)?;
+    let proof = MultiProof::new(proofs, &verifying_key);
+    let mut bytes = Vec::new();
+    proof.write(&mut bytes)?;
+    Ok(SealCommitOutput { proof: bytes })
 }
 
 /// Produce a Groth16 proof for a previously replicated sector.
