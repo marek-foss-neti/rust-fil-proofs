@@ -1,6 +1,8 @@
 use std::marker::PhantomData;
 use std::path::Path;
+use std::time::Instant;
 
+use anyhow::ensure;
 use filecoin_hashers::Hasher;
 use merkletree::store::StoreConfig;
 use serde::{Deserialize, Serialize};
@@ -135,15 +137,52 @@ where
         let tree_d = create_base_merkle_tree::<BinaryMerkleTree<G>>(tree_d_config, leaves, data)?;
         let comm_d = tree_d.root();
 
+        let (tau, replica_trees) = Self::replicate_layers(
+            graph,
+            layer_challenges,
+            replica_id,
+            comm_d,
+            data,
+            cache_path,
+        )?;
+        Ok((tau, tree_d, replica_trees))
+    }
+
+    /// Encode the layers after the caller has built or validated TreeD.
+    ///
+    /// `comm_d` must authenticate the original `data`. Keeping TreeD preparation separate lets
+    /// the seal API verify pieces and derive the replica ID before modifying the data, without
+    /// building TreeD again. This is a low-level primitive, not validation of an external store.
+    #[allow(clippy::type_complexity)]
+    pub fn replicate_layers(
+        graph: &ZigZagBucketGraph<Tree::Hasher>,
+        layer_challenges: &LayerChallenges,
+        replica_id: &<Tree::Hasher as Hasher>::Domain,
+        comm_d: G::Domain,
+        data: &mut [u8],
+        cache_path: Option<&Path>,
+    ) -> Result<(Tau<<Tree::Hasher as Hasher>::Domain, G::Domain>, Vec<Tree>)> {
+        let layers = layer_challenges.layers();
+        ensure!(layers > 0, "ZigZag requires at least one layer");
+        ensure!(
+            data.len() == graph.size() * NODE_SIZE,
+            "ZigZag data size mismatch"
+        );
+        let leaves = graph.size();
+
         let mut replica_trees: Vec<Tree> = Vec::with_capacity(layers);
         let mut layer_comm_rs = Vec::with_capacity(layers);
         let mut current_graph = graph.clone();
 
         for layer in 0..layers {
+            let started = Instant::now();
             vde::encode(&current_graph, replica_id, data)?;
+            log::info!(target: "zigzag_precommit", "phase=encode layer={} elapsed_ms={}", layer, started.elapsed().as_millis());
+            let started = Instant::now();
             let tree_r_config =
                 cache_path.map(|p| StoreConfig::new(p, format!("zigzag-tree-r-{layer}"), 0));
             let tree_r = create_base_merkle_tree::<Tree>(tree_r_config, leaves, data)?;
+            log::info!(target: "zigzag_precommit", "phase=tree_r layer={} elapsed_ms={}", layer, started.elapsed().as_millis());
             layer_comm_rs.push(tree_r.root());
             replica_trees.push(tree_r);
             current_graph = Self::transform(&current_graph);
@@ -157,7 +196,6 @@ where
                 layer_comm_rs,
                 comm_r_star: comm_r_star_val,
             },
-            tree_d,
             replica_trees,
         ))
     }

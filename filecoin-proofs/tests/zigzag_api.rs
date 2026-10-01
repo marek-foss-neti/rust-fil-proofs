@@ -20,8 +20,9 @@ use filecoin_proofs::types::{
 use filecoin_proofs::{
     add_piece, zigzag_comm_r_bound, zigzag_commit_phase1_from_cache, zigzag_commit_phase2,
     zigzag_load_aux, zigzag_pre_commit, zigzag_pre_commit_phase1,
-    zigzag_pre_commit_phase1_with_replica_id, zigzag_pre_commit_phase2, zigzag_prove,
-    zigzag_prove_from_cache, zigzag_unseal, zigzag_unseal_range, zigzag_verify_seal,
+    zigzag_pre_commit_phase1_with_replica_id, zigzag_pre_commit_phase1_with_tree_d,
+    zigzag_pre_commit_phase2, zigzag_prove, zigzag_prove_from_cache, zigzag_unseal,
+    zigzag_unseal_range, zigzag_verify_seal,
 };
 use rand::rngs::OsRng;
 use serde::Deserialize;
@@ -35,6 +36,151 @@ const PROVER_ID: [u8; 32] = [4u8; 32];
 const TICKET: [u8; 32] = [7u8; 32];
 const SEED: [u8; 32] = [0xffu8; 32];
 const POREP_ID: [u8; 32] = [42u8; 32];
+
+#[test]
+fn stage2_single_tree_d_and_import_preserve_replica_and_all_layer_trees() -> anyhow::Result<()> {
+    use filecoin_proofs::constants::DefaultPieceHasher;
+    use storage_proofs_core::merkle::MerkleTreeTrait;
+    use storage_proofs_porep::stacked::generate_replica_id;
+    let config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, POREP_ID, ApiVersion::V1_2_0);
+    let sector_id = SectorId::from(0);
+    let (original, pieces) = stage_sector(SECTOR_SIZE_2_KIB);
+    let root = tempfile::tempdir()?;
+    let reference_cache = root.path().join("reference");
+    std::fs::create_dir(&reference_cache)?;
+    let replica_id = generate_replica_id::<filecoin_proofs::constants::DefaultTreeHasher, _>(
+        &PROVER_ID,
+        sector_id.into(),
+        &TICKET,
+        pieces[0].commitment,
+        &POREP_ID,
+    );
+    let params = zigzag_public_params::<ZigZagTree>(&config)?;
+    let mut reference = original.clone();
+    // Retained low-level entry point is independent of the seal API's TreeD lifecycle.
+    let (tau, tree_d, trees) =
+        ZigZagDrgPoRep::<ZigZagTree, DefaultPieceHasher>::transform_and_replicate_layers(
+            &params.graph,
+            &params.layer_challenges,
+            &replica_id,
+            &mut reference,
+            Some(&reference_cache),
+        )?;
+    assert_eq!(tau.comm_d, tree_d.root());
+    assert_eq!(tau.layer_comm_rs.len(), trees.len());
+    drop((tree_d, trees));
+    let source = merkletree::store::StoreConfig::data_path(&reference_cache, "zigzag-tree-d");
+    let replica_id: [u8; 32] = replica_id.into();
+    let mut expected = None;
+    for mode in ["ordinary", "replica-id", "import"] {
+        let cache = root.path().join(mode);
+        let mut data = original.clone();
+        let (output, state) = match mode {
+            "ordinary" => zigzag_pre_commit_phase1::<ZigZagTree>(
+                &config, &cache, PROVER_ID, sector_id, TICKET, &mut data, &pieces,
+            )?,
+            "replica-id" => zigzag_pre_commit_phase1_with_replica_id::<ZigZagTree>(
+                &config,
+                &cache,
+                replica_id,
+                pieces[0].commitment,
+                &mut data,
+            )?,
+            _ => zigzag_pre_commit_phase1_with_tree_d::<ZigZagTree>(
+                &config,
+                &cache,
+                replica_id,
+                pieces[0].commitment,
+                &mut data,
+                &source,
+            )?,
+        };
+        drop(state);
+        assert_eq!(data, reference);
+        if let Some(expected) = expected {
+            assert_eq!(output, expected);
+        }
+        expected = Some(output);
+        for entry in std::fs::read_dir(&reference_cache)? {
+            let entry = entry?;
+            assert_eq!(
+                std::fs::read(entry.path())?,
+                std::fs::read(cache.join(entry.file_name()))?
+            );
+        }
+        let c1 = zigzag_commit_phase1_from_cache::<ZigZagTree>(
+            &config,
+            &cache,
+            output.comm_d,
+            output.comm_r,
+            output.comm_r_star,
+            PROVER_ID,
+            sector_id,
+            TICKET,
+            Some(SEED),
+        )?;
+        assert_eq!(c1.vanilla_proofs.len(), usize::from(config.partitions));
+        let mut wrong_prover = PROVER_ID;
+        wrong_prover[0] ^= 1;
+        assert!(zigzag_commit_phase1_from_cache::<ZigZagTree>(
+            &config,
+            &cache,
+            output.comm_d,
+            output.comm_r,
+            output.comm_r_star,
+            wrong_prover,
+            sector_id,
+            TICKET,
+            Some(SEED),
+        )
+        .is_err());
+        zigzag_unseal::<ZigZagTree>(
+            &config,
+            PROVER_ID,
+            sector_id,
+            TICKET,
+            output.comm_d,
+            &mut data,
+        )?;
+        assert_eq!(data, original);
+    }
+    Ok(())
+}
+
+#[test]
+fn stage2_invalid_inputs_fail_before_encoding() -> anyhow::Result<()> {
+    let config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, POREP_ID, ApiVersion::V1_2_0);
+    let (original, mut pieces) = stage_sector(SECTOR_SIZE_2_KIB);
+    let cache = tempfile::tempdir()?;
+    let mut data = original.clone();
+    pieces[0].commitment[0] ^= 1;
+    assert!(zigzag_pre_commit_phase1::<ZigZagTree>(
+        &config,
+        cache.path(),
+        PROVER_ID,
+        SectorId::from(0),
+        TICKET,
+        &mut data,
+        &pieces,
+    )
+    .is_err());
+    assert_eq!(data, original);
+    assert!(!cache.path().join("zigzag-aux.json").exists());
+    let source = merkletree::store::StoreConfig::data_path(cache.path(), "zigzag-tree-d");
+    let imported = tempfile::tempdir()?;
+    assert!(zigzag_pre_commit_phase1_with_tree_d::<ZigZagTree>(
+        &config,
+        imported.path(),
+        [4; 32],
+        pieces[0].commitment,
+        &mut data,
+        source,
+    )
+    .is_err());
+    assert_eq!(data, original);
+    assert!(!imported.path().join("zigzag-aux.json").exists());
+    Ok(())
+}
 
 #[derive(Debug, Deserialize)]
 struct CurioZigZagProofSidecar {
