@@ -556,7 +556,7 @@ mod tests {
     type Piece = Sha256Hasher;
 
     #[test]
-    fn stage4_decode_buffers_orientations_parity_and_workers() {
+    fn decode_buffers_orientations_parity_and_workers() {
         let sp = SetupParams {
             nodes: 65536,
             degree: BASE_DEGREE,

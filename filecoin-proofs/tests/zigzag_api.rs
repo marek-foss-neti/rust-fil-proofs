@@ -38,7 +38,7 @@ const SEED: [u8; 32] = [0xffu8; 32];
 const POREP_ID: [u8; 32] = [42u8; 32];
 
 #[test]
-fn stage4_unseal_full_unaligned_ranges_and_invalid_bounds() -> anyhow::Result<()> {
+fn unseal_full_unaligned_ranges_and_invalid_bounds() -> anyhow::Result<()> {
     use filecoin_proofs::zigzag_unseal_range_with_scratch;
     let config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, POREP_ID, ApiVersion::V1_2_0);
     let raw: Vec<u8> = (0..2032).map(|i| (i * 31 + i / 7) as u8).collect();
@@ -144,7 +144,7 @@ fn stage4_unseal_full_unaligned_ranges_and_invalid_bounds() -> anyhow::Result<()
 }
 
 #[test]
-fn stage2_single_tree_d_and_import_preserve_replica_and_all_layer_trees() -> anyhow::Result<()> {
+fn single_tree_d_and_import_preserve_replica_and_all_layer_trees() -> anyhow::Result<()> {
     use filecoin_proofs::constants::DefaultPieceHasher;
     use storage_proofs_core::merkle::MerkleTreeTrait;
     use storage_proofs_porep::stacked::generate_replica_id;
@@ -254,7 +254,7 @@ fn stage2_single_tree_d_and_import_preserve_replica_and_all_layer_trees() -> any
 }
 
 #[test]
-fn stage2_invalid_inputs_fail_before_encoding() -> anyhow::Result<()> {
+fn precommit_invalid_inputs_fail_before_encoding() -> anyhow::Result<()> {
     let config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, POREP_ID, ApiVersion::V1_2_0);
     let (original, mut pieces) = stage_sector(SECTOR_SIZE_2_KIB);
     let cache = tempfile::tempdir()?;
@@ -771,9 +771,9 @@ fn test_zigzag_cached_seal_lifecycle_2kib() {
 // These two tests are intentionally run in separate remote containers. The
 // serialized C1 artifact and parameter cache are mounted into the C2 process.
 #[test]
-#[ignore = "remote-only stage 3 fixture: generates parameters and disk-backed vanilla proofs"]
-fn stage3_prepare_ten_partition_c1() {
-    let root = PathBuf::from(std::env::var("ZIGZAG_STAGE3_FIXTURE_ROOT").expect("fixture root"));
+#[ignore = "remote-only C1 fixture: generates parameters and disk-backed vanilla proofs"]
+fn prepare_ten_partition_c1() {
+    let root = PathBuf::from(std::env::var("ZIGZAG_C1_FIXTURE_ROOT").expect("fixture root"));
     let params = root.join("params");
     let cache = root.join("seal-cache");
     std::fs::create_dir_all(&params).expect("param cache");
@@ -815,9 +815,9 @@ fn stage3_prepare_ten_partition_c1() {
 }
 
 #[test]
-#[ignore = "remote-only stage 3 C2: reads serialized vanilla proofs in a fresh process"]
-fn stage3_prove_serialized_ten_partitions() {
-    let root = PathBuf::from(std::env::var("ZIGZAG_STAGE3_FIXTURE_ROOT").expect("fixture root"));
+#[ignore = "remote-only C2 proving: reads serialized vanilla proofs in a fresh process"]
+fn prove_serialized_ten_partitions() {
+    let root = PathBuf::from(std::env::var("ZIGZAG_C1_FIXTURE_ROOT").expect("fixture root"));
     std::env::set_var("FIL_PROOFS_PARAMETER_CACHE", root.join("params"));
     let mut config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, POREP_ID, ApiVersion::V1_2_0);
     config.partitions = filecoin_proofs::types::PoRepProofPartitions(10);
