@@ -248,8 +248,10 @@ fn zigzag_pre_commit_with_replica_id_domain<Tree: 'static + MerkleTreeTrait>(
 /// were written into `data` (via [`crate::add_piece`]); they are verified against the resulting
 /// Sha256 CommD. When `cache_path` is `Some`, Merkle trees are persisted under that directory
 /// (disk-backed stores) and a [`ZigZagAux`] manifest is written for resumability.
-/// TreeD must not already exist there: callers should use a fresh private cache for retries, or
-/// [`zigzag_pre_commit_phase1_with_tree_d`] for explicit, validated reuse of an existing tree.
+/// TreeD must not already exist there. Rejected piece/CommD validation removes the new TreeD,
+/// allowing corrected input to retry in the same cache. After encoding starts, retries require
+/// fresh original data and a fresh private cache. Use [`zigzag_pre_commit_phase1_with_tree_d`]
+/// for explicit, validated import. Callers must serialize operations on this sector/cache.
 pub fn zigzag_pre_commit<Tree: 'static + MerkleTreeTrait>(
     porep_config: &PoRepConfig,
     prover_id: ProverId,
@@ -263,13 +265,14 @@ pub fn zigzag_pre_commit<Tree: 'static + MerkleTreeTrait>(
     ensure!(!piece_infos.is_empty(), "piece_infos must not be empty");
 
     // Sha256 CommD over the fr32-padded sector data (matches Filecoin piece aggregation).
-    let tree_d = tree_d::build(data, cache_path)?;
+    let tree_d = tree_d::build_validated(data, cache_path, |comm_d| {
+        ensure!(
+            verify_pieces(&comm_d, piece_infos, porep_config.sector_size)?,
+            "pieces and comm_d do not match"
+        );
+        Ok(())
+    })?;
     let comm_d = commitment_from_domain(tree_d.root());
-
-    ensure!(
-        verify_pieces(&comm_d, piece_infos, porep_config.sector_size)?,
-        "pieces and comm_d do not match"
-    );
 
     let replica_id = generate_replica_id::<Tree::Hasher, _>(
         &prover_id,
@@ -335,11 +338,13 @@ pub fn zigzag_pre_commit_phase1_with_replica_id<Tree: 'static + MerkleTreeTrait>
         "Invalid all zero commitment (replica_id)"
     );
     let replica_id = as_safe_commitment::<TreeDomain<Tree>, _>(&replica_id, "replica_id")?;
-    let tree_d = tree_d::build(data, Some(cache_path.as_ref()))?;
-    ensure!(
-        commitment_from_domain(tree_d.root()) == comm_d,
-        "provided comm_d does not match sector data"
-    );
+    let tree_d = tree_d::build_validated(data, Some(cache_path.as_ref()), |computed| {
+        ensure!(
+            computed == comm_d,
+            "provided comm_d does not match sector data"
+        );
+        Ok(())
+    })?;
 
     zigzag_pre_commit_with_replica_id_domain(
         porep_config,
@@ -973,6 +978,9 @@ pub fn zigzag_unseal_range<Tree: 'static + MerkleTreeTrait, W: Write>(
 ) -> Result<UnpaddedBytesAmount> {
     validate_zigzag_sector_data(porep_config, data)?;
     validate_zigzag_unseal_range(data.len(), offset, num_bytes)?;
+    if num_bytes.0 == 0 {
+        return Ok(num_bytes);
+    }
     zigzag_unseal::<Tree>(porep_config, prover_id, sector_id, ticket, comm_d_in, data)?;
 
     write_zigzag_unseal_range(data, &mut unsealed_output, offset, num_bytes)
@@ -1000,6 +1008,9 @@ pub fn zigzag_unseal_range_with_scratch<Tree: 'static + MerkleTreeTrait, W: Writ
     validate_zigzag_sector_data(porep_config, data)?;
     ensure!(scratch.len() == data.len(), "ZigZag scratch size mismatch");
     validate_zigzag_unseal_range(data.len(), offset, num_bytes)?;
+    if num_bytes.0 == 0 {
+        return Ok(num_bytes);
+    }
     let pub_params = zigzag_public_params::<Tree>(porep_config)?;
     let replica_id = generate_replica_id::<Tree::Hasher, _>(
         &prover_id,

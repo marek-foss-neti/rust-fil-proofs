@@ -12,7 +12,7 @@ use filecoin_hashers::{Domain, HashFunction, Hasher};
 use merkletree::store::StoreConfig;
 use rayon::prelude::*;
 use storage_proofs_core::{
-    merkle::{create_base_merkle_tree, BinaryMerkleTree},
+    merkle::{create_base_merkle_tree, BinaryMerkleTree, MerkleTreeTrait},
     util::NODE_SIZE,
 };
 
@@ -50,6 +50,25 @@ pub(super) fn build(
         data,
     )?;
     log::info!(target: "zigzag_precommit", "phase=tree_d_build elapsed_ms={}", started.elapsed().as_millis());
+    Ok(tree)
+}
+
+/// Validate the newly built root before encoding. Callers serialize access to this cache.
+/// A validation failure owns only this new TreeD, never a previously published generation.
+pub(super) fn build_validated(
+    data: &[u8],
+    cache_path: Option<&Path>,
+    check_comm_d: impl FnOnce(Commitment) -> Result<()>,
+) -> Result<BinaryMerkleTree<DefaultPieceHasher>> {
+    let tree = build(data, cache_path)?;
+    if let Err(error) = check_comm_d(super::commitment_from_domain(tree.root())) {
+        drop(tree);
+        if let Some(path) = cache_path {
+            fs::remove_file(StoreConfig::data_path(path, ID))
+                .with_context(|| format!("remove rejected ZigZag TreeD after: {error:#}"))?;
+        }
+        return Err(error);
+    }
     Ok(tree)
 }
 

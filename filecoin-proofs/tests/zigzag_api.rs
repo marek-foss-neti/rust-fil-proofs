@@ -101,9 +101,13 @@ fn unseal_full_unaligned_ranges_and_invalid_bounds() -> anyhow::Result<()> {
             };
             assert_eq!(written.0, size);
             assert_eq!(output, raw[offset as usize..(offset + size) as usize]);
+            if size == 0 {
+                assert_eq!(data, replica, "empty ranges must not decode the replica");
+                assert!(scratch.iter().all(|b| *b == 0xa5));
+            }
         }
     }
-    for (offset, size) in [(2032, 1), (u64::MAX, 2)] {
+    for (offset, size) in [(2032, 1), (2033, 0), (u64::MAX, 2)] {
         for buffered in [false, true] {
             let mut data = replica.clone();
             let mut scratch = vec![0xa5; data.len()];
@@ -256,35 +260,98 @@ fn single_tree_d_and_import_preserve_replica_and_all_layer_trees() -> anyhow::Re
 #[test]
 fn precommit_invalid_inputs_fail_before_encoding() -> anyhow::Result<()> {
     let config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, POREP_ID, ApiVersion::V1_2_0);
-    let (original, mut pieces) = stage_sector(SECTOR_SIZE_2_KIB);
+    let (original, pieces) = stage_sector(SECTOR_SIZE_2_KIB);
+    let mut wrong_pieces = pieces.clone();
+    wrong_pieces[0].commitment[0] ^= 1;
+    // Both false commitments and errors returned by verify_pieces must clean up TreeD.
+    let mut malformed_pieces = pieces.clone();
+    malformed_pieces[0].size = UnpaddedBytesAmount(4064);
+    for invalid in [wrong_pieces.clone(), malformed_pieces] {
+        let cache = tempfile::tempdir()?;
+        let mut data = original.clone();
+        assert!(zigzag_pre_commit_phase1::<ZigZagTree>(
+            &config,
+            cache.path(),
+            PROVER_ID,
+            SectorId::from(0),
+            TICKET,
+            &mut data,
+            &invalid,
+        )
+        .is_err());
+        assert_eq!(data, original);
+        assert_eq!(std::fs::read_dir(cache.path())?.count(), 0);
+        let (_, state) = zigzag_pre_commit_phase1::<ZigZagTree>(
+            &config,
+            cache.path(),
+            PROVER_ID,
+            SectorId::from(0),
+            TICKET,
+            &mut data,
+            &pieces,
+        )?;
+        drop(state);
+        let tree_path = merkletree::store::StoreConfig::data_path(cache.path(), "zigzag-tree-d");
+        let tree_before = std::fs::read(&tree_path)?;
+        // Refusing an existing generation must never delete it while handling the error.
+        assert!(zigzag_pre_commit_phase1::<ZigZagTree>(
+            &config,
+            cache.path(),
+            PROVER_ID,
+            SectorId::from(0),
+            TICKET,
+            &mut original.clone(),
+            &invalid,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(tree_path)?, tree_before);
+        assert!(cache.path().join("zigzag-aux.json").exists());
+    }
     let cache = tempfile::tempdir()?;
     let mut data = original.clone();
-    pieces[0].commitment[0] ^= 1;
-    assert!(zigzag_pre_commit_phase1::<ZigZagTree>(
+    assert!(zigzag_pre_commit_phase1_with_replica_id::<ZigZagTree>(
         &config,
         cache.path(),
-        PROVER_ID,
-        SectorId::from(0),
-        TICKET,
+        [4; 32],
+        wrong_pieces[0].commitment,
         &mut data,
-        &pieces,
     )
     .is_err());
     assert_eq!(data, original);
-    assert!(!cache.path().join("zigzag-aux.json").exists());
+    assert_eq!(std::fs::read_dir(cache.path())?.count(), 0);
+    let (_, state) = zigzag_pre_commit_phase1_with_replica_id::<ZigZagTree>(
+        &config,
+        cache.path(),
+        [4; 32],
+        pieces[0].commitment,
+        &mut data,
+    )?;
+    drop(state);
     let source = merkletree::store::StoreConfig::data_path(cache.path(), "zigzag-tree-d");
+    let source_before = std::fs::read(&source)?;
     let imported = tempfile::tempdir()?;
+    let mut data = original.clone();
     assert!(zigzag_pre_commit_phase1_with_tree_d::<ZigZagTree>(
+        &config,
+        imported.path(),
+        [4; 32],
+        wrong_pieces[0].commitment,
+        &mut data,
+        &source,
+    )
+    .is_err());
+    assert_eq!(data, original);
+    assert_eq!(std::fs::read_dir(imported.path())?.count(), 0);
+    assert_eq!(std::fs::read(&source)?, source_before);
+    let (_, state) = zigzag_pre_commit_phase1_with_tree_d::<ZigZagTree>(
         &config,
         imported.path(),
         [4; 32],
         pieces[0].commitment,
         &mut data,
-        source,
-    )
-    .is_err());
-    assert_eq!(data, original);
-    assert!(!imported.path().join("zigzag-aux.json").exists());
+        &source,
+    )?;
+    drop(state);
     Ok(())
 }
 
