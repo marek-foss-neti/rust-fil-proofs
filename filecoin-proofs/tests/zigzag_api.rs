@@ -38,6 +38,112 @@ const SEED: [u8; 32] = [0xffu8; 32];
 const POREP_ID: [u8; 32] = [42u8; 32];
 
 #[test]
+fn stage4_unseal_full_unaligned_ranges_and_invalid_bounds() -> anyhow::Result<()> {
+    use filecoin_proofs::zigzag_unseal_range_with_scratch;
+    let config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, POREP_ID, ApiVersion::V1_2_0);
+    let raw: Vec<u8> = (0..2032).map(|i| (i * 31 + i / 7) as u8).collect();
+    let mut replica = Vec::new();
+    let (piece, _) = add_piece(
+        Cursor::new(&raw),
+        &mut replica,
+        UnpaddedBytesAmount(2032),
+        &[],
+    )?;
+    let (commitments, state) = zigzag_pre_commit::<ZigZagTree>(
+        &config,
+        PROVER_ID,
+        SectorId::from(0),
+        TICKET,
+        &mut replica,
+        &[piece],
+        None,
+    )?;
+    drop(state);
+    for (offset, size) in [
+        (0, 2032),
+        (1, 1),
+        (31, 130),
+        (126, 129),
+        (127, 127),
+        (128, 400),
+        (2031, 1),
+        (2032, 0),
+    ] {
+        for buffered in [false, true] {
+            let mut data = replica.clone();
+            let mut scratch = vec![0xa5; data.len()];
+            let mut output = Vec::new();
+            let written = if buffered {
+                zigzag_unseal_range_with_scratch::<ZigZagTree, _>(
+                    &config,
+                    PROVER_ID,
+                    SectorId::from(0),
+                    TICKET,
+                    commitments.comm_d,
+                    &mut data,
+                    &mut scratch,
+                    &mut output,
+                    UnpaddedByteIndex(offset),
+                    UnpaddedBytesAmount(size),
+                )?
+            } else {
+                zigzag_unseal_range::<ZigZagTree, _>(
+                    &config,
+                    PROVER_ID,
+                    SectorId::from(0),
+                    TICKET,
+                    commitments.comm_d,
+                    &mut data,
+                    &mut output,
+                    UnpaddedByteIndex(offset),
+                    UnpaddedBytesAmount(size),
+                )?
+            };
+            assert_eq!(written.0, size);
+            assert_eq!(output, raw[offset as usize..(offset + size) as usize]);
+        }
+    }
+    for (offset, size) in [(2032, 1), (u64::MAX, 2)] {
+        for buffered in [false, true] {
+            let mut data = replica.clone();
+            let mut scratch = vec![0xa5; data.len()];
+            let mut output = Vec::new();
+            let result = if buffered {
+                zigzag_unseal_range_with_scratch::<ZigZagTree, _>(
+                    &config,
+                    PROVER_ID,
+                    SectorId::from(0),
+                    TICKET,
+                    commitments.comm_d,
+                    &mut data,
+                    &mut scratch,
+                    &mut output,
+                    UnpaddedByteIndex(offset),
+                    UnpaddedBytesAmount(size),
+                )
+            } else {
+                zigzag_unseal_range::<ZigZagTree, _>(
+                    &config,
+                    PROVER_ID,
+                    SectorId::from(0),
+                    TICKET,
+                    commitments.comm_d,
+                    &mut data,
+                    &mut output,
+                    UnpaddedByteIndex(offset),
+                    UnpaddedBytesAmount(size),
+                )
+            };
+            assert!(result.is_err());
+            assert!(output.is_empty());
+            assert_eq!(data, replica);
+            assert!(scratch.iter().all(|b| *b == 0xa5));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn stage2_single_tree_d_and_import_preserve_replica_and_all_layer_trees() -> anyhow::Result<()> {
     use filecoin_proofs::constants::DefaultPieceHasher;
     use storage_proofs_core::merkle::MerkleTreeTrait;

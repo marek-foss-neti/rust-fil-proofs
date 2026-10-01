@@ -207,21 +207,60 @@ where
         replica_id: &<Tree::Hasher as Hasher>::Domain,
         data: &mut [u8],
     ) -> Result<()> {
+        ensure!(
+            data.len() == graph.size() * NODE_SIZE,
+            "ZigZag data size mismatch"
+        );
+        let mut scratch = vec![0u8; data.len()];
+        Self::extract_and_invert_transform_layers_with_scratch(
+            graph,
+            layer_challenges,
+            replica_id,
+            data,
+            &mut scratch,
+        )?;
+        // Preserve the in-place API: an odd number of swaps leaves the result in scratch.
+        // Even layer counts need no copy; odd counts need exactly one, never one per layer.
+        if layer_challenges.layers() % 2 == 1 {
+            data.copy_from_slice(&scratch);
+        }
+        Ok(())
+    }
+
+    /// Decode using two caller-owned buffers, returning the buffer holding the result.
+    /// Adapted from SDR's create_label/single.rs buffer-role swap; ZigZag must keep the
+    /// entire encoded input immutable during each parallel decode. `data` and `scratch`
+    /// are both overwritten. There are no sector-sized allocations or copies here.
+    pub fn extract_and_invert_transform_layers_with_scratch<'a>(
+        graph: &ZigZagBucketGraph<Tree::Hasher>,
+        layer_challenges: &LayerChallenges,
+        replica_id: &<Tree::Hasher as Hasher>::Domain,
+        data: &'a mut [u8],
+        scratch: &'a mut [u8],
+    ) -> Result<&'a [u8]> {
         let layers = layer_challenges.layers();
-        assert!(layers > 0);
+        ensure!(layers > 0, "ZigZag requires at least one layer");
+        ensure!(
+            data.len() == graph.size() * NODE_SIZE,
+            "ZigZag data size mismatch"
+        );
+        ensure!(scratch.len() == data.len(), "ZigZag scratch size mismatch");
 
         let mut layer_graph = graph.clone();
         for _ in 0..(layers - 1) {
             layer_graph = Self::transform(&layer_graph);
         }
 
-        for _ in 0..layers {
-            let decoded = vde::decode(&layer_graph, replica_id, data)?;
-            data.copy_from_slice(&decoded);
+        let (mut input, mut output) = (data, scratch);
+        for layer in (0..layers).rev() {
+            let started = Instant::now();
+            vde::decode_into(&layer_graph, replica_id, input, output)?;
+            log::info!(target: "zigzag_unseal", "phase=decode layer={} elapsed_ms={}", layer, started.elapsed().as_millis());
+            std::mem::swap(&mut input, &mut output);
             layer_graph = Self::invert_transform(&layer_graph);
         }
 
-        Ok(())
+        Ok(input)
     }
 }
 
@@ -515,6 +554,74 @@ mod tests {
 
     type ZZTree = MerkleTreeWrapper<PoseidonHasher, DiskStore<PoseidonDomain>, U2, U0, U0>;
     type Piece = Sha256Hasher;
+
+    #[test]
+    fn stage4_decode_buffers_orientations_parity_and_workers() {
+        let sp = SetupParams {
+            nodes: 65536,
+            degree: BASE_DEGREE,
+            expansion_degree: EXP_DEGREE,
+            porep_id: [19; 32],
+            api_version: ApiVersion::V1_2_0,
+            layer_challenges: LayerChallenges::new_fixed(1, 1),
+        };
+        let pp = setup::<ZZTree>(&sp).unwrap();
+        let replica_id = PoseidonDomain::default();
+        let mut original = vec![0u8; sp.nodes * NODE_SIZE];
+        for (i, node) in original.chunks_exact_mut(NODE_SIZE).enumerate() {
+            node[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        }
+        for reversed in [false, true] {
+            let graph = if reversed {
+                pp.graph.zigzag()
+            } else {
+                pp.graph.clone()
+            };
+            for layers in [1, 2, 3, 4] {
+                let mut encoded = original.clone();
+                let mut current_graph = graph.clone();
+                for _ in 0..layers {
+                    vde::encode(&current_graph, &replica_id, &mut encoded).unwrap();
+                    current_graph = current_graph.zigzag();
+                }
+                let challenges = LayerChallenges::new_fixed(layers, 1);
+                for workers in [1, 2, 4] {
+                    rayon::ThreadPoolBuilder::new().num_threads(workers).build().unwrap().install(|| {
+                        let mut data = encoded.clone();
+                        let mut scratch = vec![0xa5; data.len()];
+                        let expected_ptr = if layers % 2 == 0 { data.as_ptr() } else { scratch.as_ptr() };
+                        let decoded = ZigZagDrgPoRep::<ZZTree, Piece>::extract_and_invert_transform_layers_with_scratch(
+                            &graph, &challenges, &replica_id, &mut data, &mut scratch,
+                        ).unwrap();
+                        assert_eq!(decoded, original);
+                        assert_eq!(decoded.as_ptr(), expected_ptr);
+                        let mut in_place = encoded.clone();
+                        ZigZagDrgPoRep::<ZZTree, Piece>::extract_and_invert_transform_layers(
+                            &graph, &challenges, &replica_id, &mut in_place,
+                        ).unwrap();
+                        assert_eq!(in_place, original);
+                    });
+                }
+            }
+            let mut encoded = original.clone();
+            vde::encode(&graph, &replica_id, &mut encoded).unwrap();
+            let before = encoded.clone();
+            let mut short = vec![0xa5; encoded.len() - NODE_SIZE];
+            assert!(vde::decode_into(&graph, &replica_id, &encoded, &mut short).is_err());
+            assert!(short.iter().all(|byte| *byte == 0xa5));
+            let mut output = vec![0; encoded.len()];
+            vde::decode_into(&graph, &replica_id, &encoded, &mut output).unwrap();
+            assert_eq!(output, original);
+            assert_eq!(
+                encoded, before,
+                "parallel decode must not modify encoded parents"
+            );
+            assert_eq!(
+                vde::decode(&graph, &replica_id, &encoded).unwrap(),
+                original
+            );
+        }
+    }
 
     fn replicate_extract_roundtrip(layers: usize) {
         let nodes = 128;

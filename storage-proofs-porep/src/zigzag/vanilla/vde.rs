@@ -451,6 +451,28 @@ where
     ensure_graph_data_len(graph, data)?;
 
     let mut out = vec![0u8; data.len()];
+    decode_into(graph, replica_id, data, &mut out)?;
+    Ok(out)
+}
+
+/// Decode an immutable encoded layer into a separate, caller-owned buffer.
+/// Both buffers must contain exactly one sector. The output may be reused between layers;
+/// it must never alias the input, whose parent nodes are read in parallel throughout decoding.
+pub fn decode_into<H, G>(
+    graph: &ZigZagGraph<H, G>,
+    replica_id: &H::Domain,
+    data: &[u8],
+    out: &mut [u8],
+) -> Result<()>
+where
+    H: Hasher,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+{
+    ensure_graph_data_len(graph, data)?;
+    ensure!(
+        out.len() == data.len(),
+        "ZigZag decode output size mismatch"
+    );
     let use_parent_table = SETTINGS.use_zigzag_parent_cache;
 
     out.par_chunks_mut(DECODE_CHUNK_NODES * NODE_SIZE)
@@ -490,7 +512,7 @@ where
             },
         )?;
 
-    Ok(out)
+    Ok(())
 }
 
 /// Decodes a single node of `data`.

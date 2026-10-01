@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use storage_proofs_core::{
     compound_proof::{self, CompoundProof},
     drgraph::Graph,
-    merkle::{BinaryMerkleTree, MerkleTreeTrait, Store},
+    merkle::{BinaryMerkleTree, MerkleProofTrait, MerkleTreeTrait, Store},
     multi_proof::MultiProof,
     proof::ProofScheme,
     sector::SectorId,
@@ -623,13 +623,32 @@ where
     })
 }
 
-/// Create Groth16 proofs from a serialized C1 result, without the sector cache.
-pub fn zigzag_commit_phase2<Tree: 'static + MerkleTreeTrait>(
+/// Validate a persisted C1 before reuse, without opening trees or Groth16 parameters.
+/// Shares all context, commitment and vanilla checks with C2.
+pub fn zigzag_validate_commit_phase1<Tree: 'static + MerkleTreeTrait>(
     porep_config: &PoRepConfig,
-    phase1: ZigZagCommitPhase1Output<Tree>,
+    phase1: &ZigZagCommitPhase1Output<Tree>,
     prover_id: ProverId,
     sector_id: SectorId,
-) -> Result<SealCommitOutput>
+) -> Result<()>
+where
+    TreeDomain<Tree>: From<blstrs::Scalar>,
+{
+    validated_zigzag_commit_phase1(porep_config, phase1, prover_id, sector_id)?;
+    Ok(())
+}
+
+type ValidatedZigZagCommitPhase1<Tree> = (
+    PublicInputs<TreeDomain<Tree>, DefaultPieceDomain>,
+    compound_proof::PublicParams<'static, ZigZagDrgPoRep<Tree, DefaultPieceHasher>>,
+);
+
+fn validated_zigzag_commit_phase1<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
+    phase1: &ZigZagCommitPhase1Output<Tree>,
+    prover_id: ProverId,
+    sector_id: SectorId,
+) -> Result<ValidatedZigZagCommitPhase1<Tree>>
 where
     TreeDomain<Tree>: From<blstrs::Scalar>,
 {
@@ -708,13 +727,58 @@ where
         "ZigZag C1 layer count mismatch"
     );
     ensure!(
+        phase1
+            .vanilla_proofs
+            .iter()
+            .all(|proof| proof.layer_comm_rs == layer_comm_rs),
+        "ZigZag C1 vanilla roots do not match the envelope"
+    );
+    // The circuit binds witness data to the included leaf. Check that same binding
+    // before reuse as well as the Merkle paths/encoding checked by the vanilla verifier.
+    for proof in &phase1.vanilla_proofs {
+        ensure!(
+            proof
+                .layer0_data_nodes
+                .iter()
+                .all(|node| node.data == node.proof.leaf())
+                && proof.encoding_proofs.iter().all(|layer| {
+                    layer
+                        .replica_nodes
+                        .iter()
+                        .chain(&layer.nodes)
+                        .chain(layer.replica_parents.iter().flatten().map(|(_, node)| node))
+                        .all(|node| node.data == node.proof.leaf())
+                }),
+            "ZigZag C1 vanilla data does not match included leaves"
+        );
+    }
+    // A deserializable but malformed Merkle path can panic in the shared verifier
+    // (e.g. an out-of-range insertion index). Convert that into invalid C1 so retries
+    // regenerate it; do not change the verifier used by SDR or keep reusing this file.
+    let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ZigZagDrgPoRep::<Tree, DefaultPieceHasher>::verify_all_partitions(
             &params.vanilla_params,
             &public_inputs,
             &phase1.vanilla_proofs,
-        )?,
-        "invalid serialized ZigZag vanilla proofs"
-    );
+        )
+    }))
+    .map_err(|_| anyhow::anyhow!("malformed serialized ZigZag vanilla proof"))??;
+    ensure!(verified, "invalid serialized ZigZag vanilla proofs");
+    Ok((public_inputs, params))
+}
+
+/// Create Groth16 proofs from a serialized C1 result, without the sector cache.
+pub fn zigzag_commit_phase2<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
+    phase1: ZigZagCommitPhase1Output<Tree>,
+    prover_id: ProverId,
+    sector_id: SectorId,
+) -> Result<SealCommitOutput>
+where
+    TreeDomain<Tree>: From<blstrs::Scalar>,
+{
+    let (public_inputs, params) =
+        validated_zigzag_commit_phase1(porep_config, &phase1, prover_id, sector_id)?;
     let groth_params = get_zigzag_params::<Tree>(porep_config)?;
     let proofs = ZigZagCompound::<Tree, DefaultPieceHasher>::circuit_proofs(
         &public_inputs,
@@ -871,12 +935,7 @@ pub fn zigzag_unseal<Tree: 'static + MerkleTreeTrait>(
     comm_d_in: Commitment,
     data: &mut [u8],
 ) -> Result<()> {
-    ensure!(
-        data.len() % NODE_SIZE == 0,
-        "data length ({}) must be a multiple of the node size ({})",
-        data.len(),
-        NODE_SIZE,
-    );
+    validate_zigzag_sector_data(porep_config, data)?;
 
     let pub_params = zigzag_public_params::<Tree>(porep_config)?;
 
@@ -912,16 +971,75 @@ pub fn zigzag_unseal_range<Tree: 'static + MerkleTreeTrait, W: Write>(
     offset: UnpaddedByteIndex,
     num_bytes: UnpaddedBytesAmount,
 ) -> Result<UnpaddedBytesAmount> {
+    validate_zigzag_sector_data(porep_config, data)?;
+    validate_zigzag_unseal_range(data.len(), offset, num_bytes)?;
     zigzag_unseal::<Tree>(porep_config, prover_id, sector_id, ticket, comm_d_in, data)?;
 
-    let offset_padded: PaddedBytesAmount = UnpaddedBytesAmount::from(offset).into();
-    let num_bytes_padded: PaddedBytesAmount = num_bytes.into();
-    let start: usize = offset_padded.into();
-    let end = start + usize::from(num_bytes_padded);
-    ensure!(end <= data.len(), "unseal range exceeds sector size");
+    write_zigzag_unseal_range(data, &mut unsealed_output, offset, num_bytes)
+}
 
-    let written = write_unpadded(&data[start..end], &mut unsealed_output, 0, num_bytes.into())
+/// Unseal with two caller-owned sector buffers (heap or writable file mappings).
+///
+/// `data` initially contains the sealed sector. Both buffers are overwritten; the result may
+/// reside in either one depending on layer parity, and is streamed directly to the writer
+/// without a final sector copy. Preserve the original sealed file separately. This API neither
+/// allocates sector buffers nor flushes caller-owned mappings. Range offsets are unpadded bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn zigzag_unseal_range_with_scratch<Tree: 'static + MerkleTreeTrait, W: Write>(
+    porep_config: &PoRepConfig,
+    prover_id: ProverId,
+    sector_id: SectorId,
+    ticket: Ticket,
+    comm_d_in: Commitment,
+    data: &mut [u8],
+    scratch: &mut [u8],
+    mut unsealed_output: W,
+    offset: UnpaddedByteIndex,
+    num_bytes: UnpaddedBytesAmount,
+) -> Result<UnpaddedBytesAmount> {
+    validate_zigzag_sector_data(porep_config, data)?;
+    ensure!(scratch.len() == data.len(), "ZigZag scratch size mismatch");
+    validate_zigzag_unseal_range(data.len(), offset, num_bytes)?;
+    let pub_params = zigzag_public_params::<Tree>(porep_config)?;
+    let replica_id = generate_replica_id::<Tree::Hasher, _>(
+        &prover_id,
+        sector_id.into(),
+        &ticket,
+        comm_d_in,
+        &porep_config.porep_id,
+    );
+    let decoded = ZigZagDrgPoRep::<Tree, DefaultPieceHasher>::extract_and_invert_transform_layers_with_scratch(
+        &pub_params.graph, &pub_params.layer_challenges, &replica_id, data, scratch,
+    )?;
+    write_zigzag_unseal_range(decoded, &mut unsealed_output, offset, num_bytes)
+}
+
+fn validate_zigzag_unseal_range(
+    padded_len: usize,
+    offset: UnpaddedByteIndex,
+    num_bytes: UnpaddedBytesAmount,
+) -> Result<()> {
+    let capacity = UnpaddedBytesAmount::from(PaddedBytesAmount(padded_len as u64)).0;
+    let end = offset
+        .0
+        .checked_add(num_bytes.0)
+        .context("unseal range overflow")?;
+    ensure!(end <= capacity, "unseal range exceeds sector size");
+    Ok(())
+}
+
+fn write_zigzag_unseal_range<W: Write>(
+    decoded: &[u8],
+    output: &mut W,
+    offset: UnpaddedByteIndex,
+    num_bytes: UnpaddedBytesAmount,
+) -> Result<UnpaddedBytesAmount> {
+    if num_bytes.0 == 0 {
+        return Ok(UnpaddedBytesAmount(0));
+    }
+    // Keep the full padded input and let fr32 translate the unpadded offset, including
+    // offsets inside a 127-byte group. Slicing at a rounded padded byte loses bit alignment.
+    let written = write_unpadded(decoded, output, offset.into(), num_bytes.into())
         .context("write_unpadded failed")?;
-
     Ok(UnpaddedBytesAmount(written as u64))
 }
