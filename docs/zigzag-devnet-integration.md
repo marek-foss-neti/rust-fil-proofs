@@ -68,6 +68,45 @@ Required changes:
   - Covered cached prove, split pre-commit, verification with a challenge seed, and unseal.
   - Added an ignored diagnostic test that can verify a Curio-produced cache and proof sidecar.
 
+## ZigZag encoder CPU affinity
+
+The multicore ZigZag encoder attempts to place the consumer (hashing and encoding) and its
+feeders on distinct physical cores sharing one L3 cache. With the default two feeders, this
+requires three available cores in the same L3 group. It uses the existing `hwloc` dependency
+enabled by the `multicore-sdr` Cargo feature, with a separate ZigZag core reservation pool.
+The implementation is active on Linux; other platforms and builds without `hwloc` continue
+without pinning.
+
+`FIL_PROOFS_ZIGZAG_MULTICORE_ENCODE_AFFINITY` defaults to `true`. Set it to `false` to compare
+the same encoder without affinity. The producer count still comes from
+`FIL_PROOFS_ZIGZAG_MULTICORE_ENCODE_PRODUCERS` (default `2`). No SDR settings are needed.
+
+Core selection respects the calling thread's allowed CPU mask, including container/cpuset
+restrictions and SMT siblings. Concurrent ZigZag encodes in the same process reserve disjoint
+physical cores while encoding. If no suitable group is available, topology discovery fails,
+or binding is unsupported, encoding continues without the affected affinity optimization.
+The reservation does not isolate CPUs from other processes or SDR jobs. Binding failures are
+logged; the L3-affinity startup log lists the selected consumer/producer CPU IDs.
+
+Workers inherit the caller's original CPU mask and bind themselves after starting. A scoped
+guard restores each thread's previous mask on return or unwind. The consumer is restored
+before producer joins and subsequent TreeR construction. Only scheduling changes: parent
+selection, hash inputs, replica bytes, and proof formats are unchanged. Measure encoding time
+with affinity on/off on the target host before attributing a speedup to this placement; virtual
+machines may expose an incomplete cache topology.
+
+On the Linux test host, run the focused ZigZag tests with and without `--features multicore-sdr`:
+
+```sh
+cargo test --locked --no-default-features --features multicore-sdr -p storage-proofs-porep --lib zigzag::vanilla -- --test-threads=1
+```
+
+The live affinity test is opt-in and requires at least two allowed physical cores sharing L3:
+
+```sh
+cargo test --locked --no-default-features --features multicore-sdr -p storage-proofs-porep --lib live_binding_restores_masks_after_worker_exit_and_consumer_panic -- --ignored --test-threads=1
+```
+
 ## Changes in filecoin-ffi
 
 `filecoin-ffi` was the main compatibility shim. The patch lets existing Curio and Lotus calls keep
@@ -305,4 +344,3 @@ So the practical answer is:
 - about the same changes inside the proof stack,
 - possibly more Docker build customization unless Curio Docker Devnet grows an explicit overlay
   hook for patched `rust-fil-proofs`, `filecoin-ffi`, and FVM.
-

@@ -1,4 +1,5 @@
 mod challenges;
+mod cores;
 mod graph;
 mod params;
 mod parent_table;

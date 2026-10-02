@@ -19,6 +19,7 @@ use storage_proofs_core::{
 };
 
 use crate::encode;
+use crate::zigzag::vanilla::cores::EncodeAffinity;
 use crate::zigzag::vanilla::graph::ZigZagGraph;
 use crate::zigzag::vanilla::parent_table::ZigZagParentTable;
 
@@ -98,6 +99,7 @@ struct EncodePipelineConfig {
     lookahead: usize,
     producers: usize,
     stride: usize,
+    affinity: bool,
 }
 
 struct CancelEncodeOnDrop<'a>(&'a AtomicBool);
@@ -115,6 +117,7 @@ impl EncodePipelineConfig {
         Self {
             lookahead,
             producers: SETTINGS.zigzag_multicore_encode_producers.max(1),
+            affinity: SETTINGS.zigzag_multicore_encode_affinity,
             stride: SETTINGS
                 .zigzag_multicore_encode_producer_stride
                 .max(1)
@@ -301,6 +304,16 @@ where
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Parent-table preparation may initialize Rayon; do it before binding any thread. Keep the
+    // reservation alive until every producer has joined, including startup errors and panics.
+    let affinity = EncodeAffinity::new(producers.saturating_add(1), config.affinity);
+    if !affinity.logical_cpus().is_empty() {
+        log::info!(
+            "zigzag multicore encode L3 affinity: consumer CPU {}, producer CPUs {:?}",
+            affinity.logical_cpus()[0],
+            &affinity.logical_cpus()[1..],
+        );
+    }
     let ring = EncodePrefetchRing::new(graph.degree(), lookahead);
     let data = EncodeData::new(data);
     let next_work = AtomicUsize::new(0);
@@ -322,10 +335,12 @@ where
                 let consumer_position = &consumer_position;
                 let cancelled = &cancelled;
                 let before_fill = &before_fill;
+                let affinity = &affinity;
                 let runner = before_spawn(producer)
                     .and_then(|()| {
                         scope.builder().spawn(move |_| {
                             let result = catch_unwind(AssertUnwindSafe(|| {
+                                let _affinity = affinity.bind_current(producer + 1);
                                 encode_prefetch_runner(
                                     producer,
                                     &before_fill,
@@ -366,6 +381,9 @@ where
             }
 
             let consumer_result = catch_unwind(AssertUnwindSafe(|| {
+                // Spawn every producer before narrowing the caller's mask, so workers inherit
+                // its original allowed CPUs. Restore it before joins and subsequent TreeR work.
+                let _affinity = affinity.bind_current(0);
                 encode_prefetch_consumer::<H, G>(
                     graph,
                     &data,
@@ -1011,27 +1029,30 @@ mod tests {
                 .expect("sequential encode failed");
 
             for producers in [1, 2, 4] {
-                let mut multicore = original.clone();
-                encode_multicore_with_config::<PoseidonHasher, _, _, _>(
-                    graph,
-                    false,
-                    &replica_id,
-                    &mut multicore,
-                    EncodePipelineConfig {
-                        lookahead: 4,
-                        producers,
-                        stride: 2,
-                    },
-                    |_, _| Ok(()),
-                    |_| Ok(()),
-                )
-                .expect("multicore encode failed");
-                assert_eq!(
-                    multicore,
-                    sequential,
-                    "pipeline diverged with producers={producers} reversed={}",
-                    graph.reversed()
-                );
+                for affinity in [false, true] {
+                    let mut multicore = original.clone();
+                    encode_multicore_with_config::<PoseidonHasher, _, _, _>(
+                        graph,
+                        false,
+                        &replica_id,
+                        &mut multicore,
+                        EncodePipelineConfig {
+                            lookahead: 4,
+                            producers,
+                            stride: 2,
+                            affinity,
+                        },
+                        |_, _| Ok(()),
+                        |_| Ok(()),
+                    )
+                    .expect("multicore encode failed");
+                    assert_eq!(
+                        multicore,
+                        sequential,
+                        "pipeline diverged with producers={producers} affinity={affinity} reversed={}",
+                        graph.reversed()
+                    );
+                }
             }
         }
     }
@@ -1071,6 +1092,7 @@ mod tests {
                     lookahead: 4,
                     producers: 3,
                     stride: 2,
+                    affinity: true,
                 },
                 |_, position| {
                     if startup_fault && position == 3 {
