@@ -15,6 +15,7 @@ use storage_proofs_core::{
     util::NODE_SIZE,
 };
 
+use crate::zigzag::measurements::OperationGuard;
 use crate::{
     encode,
     zigzag::vanilla::{
@@ -134,7 +135,9 @@ where
 
         let tree_d_config = cache_path.map(|p| StoreConfig::new(p, "zigzag-tree-d", 0));
         // Layer 0: Sha256 Merkle tree over the original (fr32-padded) data — this is Filecoin CommD.
+        let operation = OperationGuard::enter("tree_d_build", None);
         let tree_d = create_base_merkle_tree::<BinaryMerkleTree<G>>(tree_d_config, leaves, data)?;
+        operation.finish();
         let comm_d = tree_d.root();
 
         let (tau, replica_trees) = Self::replicate_layers(
@@ -175,14 +178,18 @@ where
         let mut current_graph = graph.clone();
 
         for layer in 0..layers {
+            let operation = OperationGuard::enter("encode", Some(layer));
             let started = Instant::now();
             vde::encode(&current_graph, replica_id, data)?;
             log::info!(target: "zigzag_precommit", "phase=encode layer={} elapsed_ms={}", layer, started.elapsed().as_millis());
+            operation.finish();
+            let operation = OperationGuard::enter("tree_r", Some(layer));
             let started = Instant::now();
             let tree_r_config =
                 cache_path.map(|p| StoreConfig::new(p, format!("zigzag-tree-r-{layer}"), 0));
             let tree_r = create_base_merkle_tree::<Tree>(tree_r_config, leaves, data)?;
             log::info!(target: "zigzag_precommit", "phase=tree_r layer={} elapsed_ms={}", layer, started.elapsed().as_millis());
+            operation.finish();
             layer_comm_rs.push(tree_r.root());
             replica_trees.push(tree_r);
             current_graph = Self::transform(&current_graph);

@@ -15,6 +15,7 @@ use storage_proofs_core::{
     merkle::{create_base_merkle_tree, BinaryMerkleTree, MerkleTreeTrait},
     util::NODE_SIZE,
 };
+use storage_proofs_porep::zigzag::measurements::OperationGuard;
 
 use crate::{
     constants::{DefaultPieceDomain, DefaultPieceHasher},
@@ -29,6 +30,7 @@ pub(super) fn build(
     data: &[u8],
     cache_path: Option<&Path>,
 ) -> Result<BinaryMerkleTree<DefaultPieceHasher>> {
+    let operation = OperationGuard::enter("tree_d_build", None);
     let started = Instant::now();
     if let Some(path) = cache_path {
         fs::create_dir_all(path).context("create ZigZag TreeD cache")?;
@@ -50,6 +52,7 @@ pub(super) fn build(
         data,
     )?;
     log::info!(target: "zigzag_precommit", "phase=tree_d_build elapsed_ms={}", started.elapsed().as_millis());
+    operation.finish();
     Ok(tree)
 }
 
@@ -109,6 +112,7 @@ pub(super) fn import(
         .open(&destination)
         .context("create private ZigZag TreeD copy (destination must not exist)")?;
     let result = (|| {
+        let operation = OperationGuard::enter("tree_d_copy", None);
         let started = Instant::now();
         ensure!(
             io::copy(&mut input, &mut output)? == expected_bytes,
@@ -116,12 +120,15 @@ pub(super) fn import(
         );
         output.sync_all()?;
         log::info!(target: "zigzag_precommit", "phase=tree_d_copy elapsed_ms={}", started.elapsed().as_millis());
+        operation.finish();
+        let operation = OperationGuard::enter("tree_d_validate", None);
         let started = Instant::now();
         validate(&destination, data, comm_d)?;
         let tree = super::reopen_zigzag_tree::<BinaryMerkleTree<DefaultPieceHasher>>(
             cache_path, ID, nodes,
         )?;
         log::info!(target: "zigzag_precommit", "phase=tree_d_validate elapsed_ms={}", started.elapsed().as_millis());
+        operation.finish();
         Ok(tree)
     })();
     drop(output);

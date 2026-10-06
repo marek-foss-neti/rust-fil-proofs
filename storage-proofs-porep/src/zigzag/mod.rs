@@ -10,6 +10,7 @@
 pub mod circuit;
 pub(crate) mod groth16_setup;
 pub(crate) mod groth16_setup_disk;
+pub mod measurements;
 pub(crate) mod vanilla;
 
 pub use vanilla::*;
