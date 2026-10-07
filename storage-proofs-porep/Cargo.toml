@@ -93,6 +93,8 @@ multicore-sdr = ["hwloc"]
 # setting is ignored, no `TemporaryAux` file will be written.
 fixed-rows-to-discard = ["storage-proofs-core/fixed-rows-to-discard"]
 cpu-profile = []
+# Opt-in only in an isolated ZigZag image; Cargo unifies sha2 features process-wide.
+zigzag-sha-asm = ["sha2/asm"]
 
 [[bench]]
 name = "encode"

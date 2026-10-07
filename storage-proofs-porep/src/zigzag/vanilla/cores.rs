@@ -24,22 +24,25 @@ pub(super) struct EncodeAffinity {
 impl EncodeAffinity {
     pub(super) fn new(workers: usize, enabled: bool) -> Self {
         if !enabled || workers == 0 {
+            log::info!(target: "zigzag_cpu", "encode affinity fallback: disabled or no workers; using OS scheduling");
             return Self::default();
         }
 
         #[cfg(all(target_os = "linux", feature = "hwloc"))]
-        if let Some(selection) = platform::reserve(workers) {
-            log::debug!(
-                "zigzag encode affinity: reserved shared-L3 CPUs {:?}",
-                selection.logical_cpus
-            );
-            return Self {
-                logical_cpus: selection.logical_cpus,
-                reserved_cpus: selection.reserved_cpus,
-            };
+        match platform::reserve(workers) {
+            Ok(selection) => {
+                return Self {
+                    logical_cpus: selection.logical_cpus,
+                    reserved_cpus: selection.reserved_cpus,
+                };
+            }
+            Err(reason) => {
+                log::info!(target: "zigzag_cpu", "encode affinity fallback: {reason}; using OS scheduling")
+            }
         }
 
-        log::debug!("zigzag encode affinity: no suitable core group; using OS scheduling");
+        #[cfg(not(all(target_os = "linux", feature = "hwloc")))]
+        log::info!(target: "zigzag_cpu", "encode affinity fallback: requires Linux build with hwloc; using OS scheduling");
         Self::default()
     }
 
@@ -231,24 +234,31 @@ mod platform {
         set.into_iter().map(|cpu| cpu as usize).collect()
     }
 
-    pub(super) fn reserve(workers: usize) -> Option<Selection> {
+    pub(super) fn reserve(workers: usize) -> Result<Selection, &'static str> {
         let mut pool = match POOL.lock() {
             Ok(pool) => pool,
             Err(_) => {
-                log::warn!("zigzag encode affinity: topology lock poisoned; skipping reservation");
-                return None;
+                return Err("topology lock poisoned");
             }
         };
         if pool.is_none() {
             *pool = Pool::new();
         }
-        let pool = pool.as_mut()?;
+        let pool = pool.as_mut().ok_or("physical core topology unavailable")?;
+        if pool.cores.is_empty() {
+            return Err("no physical cores with known L3 ancestors");
+        }
         // This is the calling thread's current mask, not a core index or the machine-wide CPU set.
-        let allowed: HashSet<_> =
-            cpu_numbers(pool.topology.get_cpubind(CpuBindFlags::CPUBIND_THREAD)?)
-                .into_iter()
-                .collect();
-        pool.reservations.reserve(&pool.cores, &allowed, workers)
+        let allowed: HashSet<_> = cpu_numbers(
+            pool.topology
+                .get_cpubind(CpuBindFlags::CPUBIND_THREAD)
+                .ok_or("calling thread's allowed CPU mask unavailable")?,
+        )
+        .into_iter()
+        .collect();
+        pool.reservations
+            .reserve(&pool.cores, &allowed, workers)
+            .ok_or("no free allowed physical core group large enough within one L3")
     }
 
     pub(super) fn release(cpus: &[usize]) {
@@ -268,7 +278,7 @@ mod platform {
         let mut pool = match POOL.lock() {
             Ok(pool) => pool,
             Err(_) => {
-                log::warn!("zigzag encode affinity: topology lock poisoned; skipping binding");
+                log::warn!(target: "zigzag_cpu", "zigzag encode affinity: topology lock poisoned; skipping binding");
                 return None;
             }
         };
@@ -278,26 +288,28 @@ mod platform {
         let prior = match topology.get_cpubind_for_thread(thread, CpuBindFlags::CPUBIND_THREAD) {
             Some(prior) => prior,
             None => {
-                log::warn!("zigzag encode affinity: cannot save current mask; skipping binding");
+                log::warn!(target: "zigzag_cpu", "zigzag encode affinity: cannot save current mask; skipping binding");
                 return None;
             }
         };
         let cpu = u32::try_from(cpu).ok()?;
         if !prior.is_set(cpu) {
-            log::warn!("zigzag encode affinity: reserved CPU {cpu} is no longer allowed");
+            log::warn!(target: "zigzag_cpu", "zigzag encode affinity: reserved CPU {cpu} is no longer allowed");
             return None;
         }
         if let Err(error) =
             topology.set_cpubind_for_thread(thread, Bitmap::from(cpu), CpuBindFlags::CPUBIND_THREAD)
         {
-            log::warn!("zigzag encode affinity: failed to bind CPU {cpu}: {error:?}");
+            log::warn!(target: "zigzag_cpu", "zigzag encode affinity: failed to bind CPU {cpu}: {error:?}");
             // A failed backend call need not be assumed atomic. Restore immediately and retain the
             // guard so it attempts restoration again on scope exit even if this attempt failed.
             if let Err(error) =
                 topology.set_cpubind_for_thread(thread, prior.clone(), CpuBindFlags::CPUBIND_THREAD)
             {
-                log::warn!("zigzag encode affinity: failed to undo binding: {error:?}");
+                log::warn!(target: "zigzag_cpu", "zigzag encode affinity: failed to undo binding: {error:?}");
             }
+        } else {
+            log::info!(target: "zigzag_cpu", "encode affinity bound thread to CPU {cpu}");
         }
         Some(Binding { thread, prior })
     }
@@ -310,7 +322,9 @@ mod platform {
                 binding.prior,
                 CpuBindFlags::CPUBIND_THREAD,
             ) {
-                log::warn!("zigzag encode affinity: failed to restore thread mask: {error:?}");
+                log::warn!(target: "zigzag_cpu", "zigzag encode affinity: failed to restore thread mask: {error:?}");
+            } else {
+                log::info!(target: "zigzag_cpu", "encode affinity restored prior thread mask before subsequent work");
             }
         }
     }
@@ -474,5 +488,18 @@ mod tests {
             assert_eq!(platform::current_binding(), prior);
             worker.join().unwrap();
         });
+        // A subsequent Rayon pool must inherit the restored broad mask.
+        let rayon = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let masks = rayon.install(|| {
+            use rayon::prelude::*;
+            (0..8)
+                .into_par_iter()
+                .map(|_| platform::current_binding())
+                .collect::<Vec<_>>()
+        });
+        assert!(masks.iter().all(|mask| mask == &prior));
     }
 }

@@ -19,6 +19,7 @@ use storage_proofs_core::{
 };
 
 use crate::encode;
+use crate::zigzag::cache_policy::{discard_file, CachePolicy};
 use crate::zigzag::vanilla::cores::EncodeAffinity;
 use crate::zigzag::vanilla::graph::ZigZagGraph;
 use crate::zigzag::vanilla::parent_table::ZigZagParentTable;
@@ -100,6 +101,7 @@ struct EncodePipelineConfig {
     producers: usize,
     stride: usize,
     affinity: bool,
+    cache_policy: CachePolicy,
 }
 
 struct CancelEncodeOnDrop<'a>(&'a AtomicBool);
@@ -111,18 +113,19 @@ impl Drop for CancelEncodeOnDrop<'_> {
 }
 
 impl EncodePipelineConfig {
-    fn from_settings(nodes: usize) -> Self {
+    fn from_settings(nodes: usize) -> Result<Self> {
         let lookahead = SETTINGS.zigzag_multicore_encode_lookahead.max(1).min(nodes);
 
-        Self {
+        Ok(Self {
             lookahead,
             producers: SETTINGS.zigzag_multicore_encode_producers.max(1),
             affinity: SETTINGS.zigzag_multicore_encode_affinity,
+            cache_policy: CachePolicy::from_env()?,
             stride: SETTINGS
                 .zigzag_multicore_encode_producer_stride
                 .max(1)
                 .min(lookahead),
-        }
+        })
     }
 }
 
@@ -214,7 +217,7 @@ where
         encode_multicore(graph, SETTINGS.use_zigzag_parent_cache, replica_id, data)
     } else {
         let parent_table = if SETTINGS.use_zigzag_parent_cache {
-            Some(ZigZagParentTable::new(graph)?)
+            Some(ZigZagParentTable::new_for_encode(graph)?)
         } else {
             None
         };
@@ -232,6 +235,11 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
+    let discard = parent_table
+        .as_ref()
+        .map(ZigZagParentTable::discard_handle)
+        .transpose()?
+        .flatten();
     let mut parents = vec![0u32; graph.degree()];
     let mut key_scratch = KeyScratch::new(graph.degree());
     for n in 0..graph.size() {
@@ -249,6 +257,10 @@ where
         encoded.write_bytes(&mut data[start..end])?;
     }
 
+    drop(parent_table);
+    if let Some(file) = discard {
+        discard_file(&file);
+    }
     Ok(())
 }
 
@@ -267,7 +279,7 @@ where
         use_parent_table,
         replica_id,
         data,
-        EncodePipelineConfig::from_settings(graph.size()),
+        EncodePipelineConfig::from_settings(graph.size())?,
         |_, _| Ok(()),
         |_| Ok(()),
     )
@@ -297,18 +309,26 @@ where
     let parent_tables = (0..producers)
         .map(|_| {
             if use_parent_table {
-                ZigZagParentTable::new(graph).map(Some)
+                ZigZagParentTable::new_for_encode_with_policy(graph, config.cache_policy).map(Some)
             } else {
                 Ok(None)
             }
         })
         .collect::<Result<Vec<_>>>()?;
+    let discard = parent_tables
+        .first()
+        .and_then(Option::as_ref)
+        .map(ZigZagParentTable::discard_handle)
+        .transpose()?
+        .flatten();
 
     // Parent-table preparation may initialize Rayon; do it before binding any thread. Keep the
     // reservation alive until every producer has joined, including startup errors and panics.
     let affinity = EncodeAffinity::new(producers.saturating_add(1), config.affinity);
+    log::info!(target: "zigzag_cpu", "encode producers={producers} stride={stride} lookahead={lookahead} parent_cache={use_parent_table} reversed={}", graph.reversed());
     if !affinity.logical_cpus().is_empty() {
         log::info!(
+            target: "zigzag_cpu",
             "zigzag multicore encode L3 affinity: consumer CPU {}, producer CPUs {:?}",
             affinity.logical_cpus()[0],
             &affinity.logical_cpus()[1..],
@@ -437,6 +457,13 @@ where
         )
     })?;
 
+    // All readers have joined and their mappings have dropped, in both orientations.
+    // Do not evict the active replica or issue advice for an interrupted traversal.
+    if scoped.is_ok() {
+        if let Some(file) = discard {
+            discard_file(&file);
+        }
+    }
     scoped
 }
 
@@ -1005,6 +1032,58 @@ mod tests {
     }
 
     #[test]
+    fn buffered_multicore_encode_matches_uncached_reference() -> Result<()> {
+        let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+            None,
+            512,
+            BASE_DEGREE,
+            EXP_DEGREE,
+            [48u8; 32],
+            ApiVersion::V1_2_0,
+        )?;
+        let replica_id = PoseidonDomain::from([12u8; 32]);
+        let mut original = vec![0u8; graph.size() * NODE_SIZE];
+        for node in 0..graph.size() {
+            original[node * NODE_SIZE] = node as u8;
+        }
+        for graph in [graph.clone(), graph.zigzag()] {
+            let mut reference = original.clone();
+            encode_sequential::<PoseidonHasher, _>(&graph, None, &replica_id, &mut reference)?;
+            for producers in [1, 2, 3, 4] {
+                for parent_buffer_nodes in [0, 17, 2048] {
+                    let mut encoded = original.clone();
+                    encode_multicore_with_config::<PoseidonHasher, _, _, _>(
+                        &graph,
+                        true,
+                        &replica_id,
+                        &mut encoded,
+                        EncodePipelineConfig {
+                            lookahead: 8,
+                            producers,
+                            stride: 3,
+                            affinity: false,
+                            cache_policy: CachePolicy {
+                                parent_buffer_nodes,
+                                parent_cache_dontneed: true,
+                                tree_r_dontneed: false,
+                            },
+                        },
+                        |_, _| Ok(()),
+                        |_| Ok(()),
+                    )?;
+                    assert_eq!(
+                        encoded,
+                        reference,
+                        "producers={producers} buffer={parent_buffer_nodes} reversed={}",
+                        graph.reversed()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn multicore_pipeline_wraps_ring_with_different_producer_counts() {
         let nodes = 128;
         let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
@@ -1028,7 +1107,7 @@ mod tests {
             encode_sequential::<PoseidonHasher, _>(graph, None, &replica_id, &mut sequential)
                 .expect("sequential encode failed");
 
-            for producers in [1, 2, 4] {
+            for producers in [1, 2, 3, 4] {
                 for affinity in [false, true] {
                     let mut multicore = original.clone();
                     encode_multicore_with_config::<PoseidonHasher, _, _, _>(
@@ -1041,6 +1120,7 @@ mod tests {
                             producers,
                             stride: 2,
                             affinity,
+                            cache_policy: CachePolicy::default(),
                         },
                         |_, _| Ok(()),
                         |_| Ok(()),
@@ -1089,6 +1169,7 @@ mod tests {
                 &replica_id,
                 &mut data,
                 EncodePipelineConfig {
+                    cache_policy: CachePolicy::default(),
                     lookahead: 4,
                     producers: 3,
                     stride: 2,

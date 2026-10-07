@@ -25,6 +25,7 @@ use storage_proofs_core::{
     settings::SETTINGS,
 };
 
+use crate::zigzag::cache_policy::{CachePolicy, MAX_PARENT_BUFFER_NODES};
 use crate::zigzag::vanilla::graph::ZigZagGraph;
 
 /// u32 = 4 bytes.
@@ -105,6 +106,10 @@ pub(crate) struct ZigZagParentTable {
     window_nodes: usize,
     cache: CacheData,
     path: PathBuf,
+    buffer_nodes: usize,
+    buffer_offset: usize,
+    buffer: Vec<u32>,
+    dontneed: bool,
 }
 
 #[derive(Debug)]
@@ -178,6 +183,54 @@ impl CacheData {
 }
 
 impl ZigZagParentTable {
+    pub(crate) fn new_for_encode<H, G>(graph: &ZigZagGraph<H, G>) -> Result<Self>
+    where
+        H: Hasher,
+        G: Graph<H> + ParameterSetMetadata + Send + Sync,
+    {
+        Self::new_for_encode_with_policy(graph, CachePolicy::from_env()?)
+    }
+
+    pub(crate) fn new_for_encode_with_policy<H, G>(
+        graph: &ZigZagGraph<H, G>,
+        policy: CachePolicy,
+    ) -> Result<Self>
+    where
+        H: Hasher,
+        G: Graph<H> + ParameterSetMetadata + Send + Sync,
+    {
+        let mut table = Self::new(graph)?;
+        table.set_buffer_nodes(policy.parent_buffer_nodes)?;
+        table.dontneed = policy.parent_cache_dontneed;
+        log::info!(target: "zigzag_cache", "parent records mmap_window_nodes={} buffer_nodes={} max_buffer_bytes={}", table.window_nodes, table.buffer_nodes, table.buffer_nodes * table.entry_bytes);
+        Ok(table)
+    }
+
+    fn set_buffer_nodes(&mut self, nodes: usize) -> Result<()> {
+        ensure!(
+            nodes <= MAX_PARENT_BUFFER_NODES,
+            "parent record buffer too large"
+        );
+        self.buffer_nodes = nodes.min(self.nodes);
+        // Reserve once at the configured bound. Reverse traversal starts at a short
+        // tail window; Vec's geometric growth from that tail must not exceed the budget.
+        self.buffer = Vec::with_capacity(
+            self.buffer_nodes
+                .checked_mul(self.degree)
+                .context("parent buffer capacity overflow")?,
+        );
+        Ok(())
+    }
+
+    // Clone the verified descriptor, never reopen a potentially replaced pathname.
+    pub(crate) fn discard_handle(&self) -> Result<Option<File>> {
+        if self.dontneed {
+            Ok(Some(self.cache.file.as_ref().try_clone()?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub(crate) fn new<H, G>(graph: &ZigZagGraph<H, G>) -> Result<Self>
     where
         H: Hasher,
@@ -261,6 +314,26 @@ impl ZigZagParentTable {
             self.degree
         );
 
+        if self.buffer_nodes > 0 {
+            if self.buffer.is_empty()
+                || node < self.buffer_offset
+                || node - self.buffer_offset >= self.buffer.len() / self.degree
+            {
+                self.fill_buffer(node)?;
+            }
+            let start = (node - self.buffer_offset) * self.degree;
+            parents[..self.degree].copy_from_slice(&self.buffer[start..start + self.degree]);
+            return Ok(());
+        }
+
+        self.ensure_window(node)?;
+        let start = (node - self.cache.offset) * self.entry_bytes;
+        let end = start + self.entry_bytes;
+        LittleEndian::read_u32_into(&self.cache.data[start..end], &mut parents[..self.degree]);
+        Ok(())
+    }
+
+    fn ensure_window(&mut self, node: usize) -> Result<()> {
         if !self.cache.contains(node) {
             let offset = (node / self.window_nodes) * self.window_nodes;
             let len = self.window_nodes.min(self.nodes - offset);
@@ -268,14 +341,35 @@ impl ZigZagParentTable {
                 .shift(offset, len, self.entry_bytes, &self.path)?;
         }
 
-        let start = node
-            .checked_sub(self.cache.offset)
-            .context("zigzag parent table window offset underflow")?
-            .checked_mul(self.entry_bytes)
-            .context("zigzag parent table offset overflow")?;
-        let end = start + self.entry_bytes;
-        LittleEndian::read_u32_into(&self.cache.data[start..end], &mut parents[..self.degree]);
+        Ok(())
+    }
 
+    fn fill_buffer(&mut self, node: usize) -> Result<()> {
+        let offset = node / self.buffer_nodes * self.buffer_nodes;
+        let count = self.buffer_nodes.min(self.nodes - offset);
+        // Do not expose a partially filled buffer if remapping fails and a caller retries.
+        self.buffer_offset = self.nodes;
+        self.buffer.resize(
+            count
+                .checked_mul(self.degree)
+                .context("parent buffer overflow")?,
+            0,
+        );
+        // Copy consecutive records once per bounded window, across mmap boundaries if needed.
+        // Address order stays increasing even when the graph traversal is reversed.
+        let mut next = offset;
+        while next < offset + count {
+            self.ensure_window(next)?;
+            let nodes = (self.cache.offset + self.cache.len - next).min(offset + count - next);
+            let start = (next - self.cache.offset) * self.entry_bytes;
+            let output = (next - offset) * self.degree;
+            LittleEndian::read_u32_into(
+                &self.cache.data[start..start + nodes * self.entry_bytes],
+                &mut self.buffer[output..output + nodes * self.degree],
+            );
+            next += nodes;
+        }
+        self.buffer_offset = offset;
         Ok(())
     }
 
@@ -302,6 +396,10 @@ impl ZigZagParentTable {
             window_nodes,
             cache: CacheData::open(0, len, entry_bytes, path, file)?,
             path: path.to_path_buf(),
+            buffer_nodes: 0,
+            buffer_offset: 0,
+            buffer: Vec::new(),
+            dontneed: false,
         })
     }
 
@@ -736,6 +834,55 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::zigzag::vanilla::graph::{ZigZagBucketGraph, EXP_DEGREE};
+
+    #[test]
+    fn buffered_records_match_graph_across_mmaps_and_reverse_traversal() -> Result<()> {
+        let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+            None,
+            4096,
+            BASE_DEGREE,
+            EXP_DEGREE,
+            [47u8; 32],
+            ApiVersion::V1_2_0,
+        )?;
+        let cache = tempdir()?;
+        for graph in [graph.clone(), graph.zigzag()] {
+            let path = cache.path().join(format!("buffered-{}", graph.reversed()));
+            for buffer_nodes in [0, 1, 17, 2048, 32768, MAX_PARENT_BUFFER_NODES] {
+                let mut table = ZigZagParentTable::new_at_path(&graph, &path)?;
+                // Small mapping windows force batch reads across mmap boundaries.
+                table.window_nodes = mmap_alignment_nodes(table.entry_bytes);
+                table
+                    .cache
+                    .shift(0, table.window_nodes, table.entry_bytes, &path)?;
+                table.set_buffer_nodes(buffer_nodes)?;
+                let mut actual = vec![0; graph.degree() + 1];
+                let mut expected = vec![0; graph.degree()];
+                for position in 0..graph.size() {
+                    let node = if graph.reversed() {
+                        graph.size() - 1 - position
+                    } else {
+                        position
+                    };
+                    graph.parents(node, &mut expected)?;
+                    actual[graph.degree()] = u32::MAX;
+                    table.read_into(node, &mut actual)?;
+                    assert_eq!(&actual[..graph.degree()], &expected);
+                    assert_eq!(actual[graph.degree()], u32::MAX);
+                    assert!(table.buffer.capacity() <= table.buffer_nodes * graph.degree());
+                }
+                assert!(table.read_into(graph.size(), &mut actual).is_err());
+                assert!(table.read_into(0, &mut []).is_err());
+                assert!(table.set_buffer_nodes(MAX_PARENT_BUFFER_NODES + 1).is_err());
+                drop(table);
+                let mut reopened = ZigZagParentTable::new_at_path(&graph, &path)?;
+                graph.parents(1, &mut expected)?;
+                reopened.read_into(1, &mut actual)?;
+                assert_eq!(&actual[..graph.degree()], &expected);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn parent_table_matches_graph_parents_both_orientations() {
