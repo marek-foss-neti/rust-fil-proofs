@@ -784,7 +784,6 @@ where
 {
     let (public_inputs, params) =
         validated_zigzag_commit_phase1(porep_config, &phase1, prover_id, sector_id)?;
-    let c2 = storage_proofs_porep::zigzag::measurements::OperationGuard::enter("groth16_c2", None);
     let groth_params = get_zigzag_params::<Tree>(porep_config)?;
     let proofs = ZigZagCompound::<Tree, DefaultPieceHasher>::circuit_proofs_with_parameters(
         &public_inputs,
@@ -797,7 +796,6 @@ where
     let proof = MultiProof::new(proofs, &verifying_key);
     let mut bytes = Vec::new();
     proof.write(&mut bytes)?;
-    c2.finish();
     Ok(SealCommitOutput { proof: bytes })
 }
 
@@ -844,7 +842,6 @@ where
         comm_d: tau.comm_d,
     };
 
-    let c2 = storage_proofs_porep::zigzag::measurements::OperationGuard::enter("groth16_c2", None);
     let groth_params = get_zigzag_params::<Tree>(porep_config)?;
     let proofs = ZigZagCompound::<Tree, DefaultPieceHasher>::prove_with_parameters(
         &compound_public_params,
@@ -859,7 +856,6 @@ where
     let mut buf = Vec::new();
     proof.write(&mut buf)?;
 
-    c2.finish();
     Ok(SealCommitOutput { proof: buf })
 }
 

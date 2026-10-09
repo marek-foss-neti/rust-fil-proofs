@@ -253,7 +253,15 @@ pub(crate) fn get_zigzag_params<Tree: 'static + MerkleTreeTrait>(
     // on concurrent cache misses; no SDR cache/type is involved.
     let mut cache = ZIGZAG_PARAM_MEMORY_CACHE
         .lock()
-        .expect("poisoned ZigZag cache");
+        .unwrap_or_else(|poisoned| {
+            // Loading and validation leave the map untouched until a complete
+            // source is ready to insert. A caught initialization panic must not
+            // prevent every later ZigZag C2 request from retrying in this worker.
+            let cache = poisoned.into_inner();
+            ZIGZAG_PARAM_MEMORY_CACHE.clear_poison();
+            log::warn!("recovered ZigZag parameter cache after a panic");
+            cache
+        });
     if let Some(params) = cache.get(&id) {
         if params.matches_path(&path) {
             ZigZagCompound::<Tree, DefaultPieceHasher>::validate_or_repair_parameter_verifying_key(

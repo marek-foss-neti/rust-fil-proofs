@@ -475,12 +475,15 @@ impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, 
     ) -> Result<Vec<groth16::Proof<Bls12>>> {
         let partitions = Self::partition_count(pub_params);
         ensure!(partitions > 0, "There must be partitions");
+        let vanilla_proving = OperationGuard::enter("vanilla_proving", None);
         let vanilla = ZigZagDrgPoRep::<Tree, G>::prove_all_partitions(
             &pub_params.vanilla_params,
             pub_in,
             priv_in,
             partitions,
         )?;
+        vanilla_proving.finish();
+        let vanilla_verification = OperationGuard::enter("vanilla_verification", None);
         ensure!(
             ZigZagDrgPoRep::<Tree, G>::verify_all_partitions(
                 &pub_params.vanilla_params,
@@ -489,6 +492,7 @@ impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, 
             )?,
             "sanity check failed"
         );
+        vanilla_verification.finish();
         Self::circuit_proofs_with_parameters(
             pub_in,
             vanilla,
@@ -542,6 +546,10 @@ impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, 
         pub_params: &PublicParams<Tree>,
         mut create_batch: impl FnMut(Vec<ZigZagCircuit<Tree, G>>) -> Result<Vec<groth16::Proof<Bls12>>>,
     ) -> Result<Vec<groth16::Proof<Bls12>>> {
+        // Both split and ordinary proving reach this boundary only after vanilla
+        // proving/validation. Parameter loading has its own operation; API-level
+        // VK lookup and seal-proof serialization remain outside this interval.
+        let c2 = OperationGuard::enter("groth16_c2", None);
         ensure!(!vanilla_proofs.is_empty(), "missing ZigZag vanilla proofs");
         let batch_size = Self::groth16_batch_size(pub_params)?;
         let proof_count = vanilla_proofs.len();
@@ -581,6 +589,7 @@ impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, 
                 result.push(groth16::Proof::<Bls12>::read(&bytes[..])?);
             }
         }
+        c2.finish();
         Ok(result)
     }
 }

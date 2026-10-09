@@ -1,5 +1,5 @@
 use super::*;
-use std::{fs, fs::File, process::Command};
+use std::{fs, fs::File, path::PathBuf, process::Command};
 
 use bellperson::{Circuit, ConstraintSystem, SynthesisError};
 use blstrs::Scalar;
@@ -23,19 +23,18 @@ impl Circuit<Scalar> for Multiply {
     }
 }
 
-#[test]
-fn zigzag_memory_cache_repairs_missing_vk_without_reloading_parameters() {
-    if std::env::var_os("ZIGZAG_VK_MEMORY_CACHE_TEST").is_none() {
+fn run_in_fresh_cache_process(test_name: &str) -> bool {
+    if std::env::var("ZIGZAG_MEMORY_CACHE_TEST").ok().as_deref() != Some(test_name) {
         // Give each process its own SETTINGS/cache directory and selected loader.
         for loader in ["compact", "mapped"] {
             let directory = tempfile::tempdir().unwrap();
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "caches::tests::zigzag_memory_cache_repairs_missing_vk_without_reloading_parameters",
+                    &format!("caches::tests::{}", test_name),
                     "--nocapture",
                 ])
-                .env("ZIGZAG_VK_MEMORY_CACHE_TEST", "1")
+                .env("ZIGZAG_MEMORY_CACHE_TEST", test_name)
                 .env("FIL_PROOFS_PARAMETER_CACHE", directory.path())
                 .env("FIL_PROOFS_VERIFY_PRODUCTION_PARAMS", "false")
                 .env("FIL_PROOFS_ZIGZAG_GENERATE_MISSING_PARAMS", "false")
@@ -50,9 +49,12 @@ fn zigzag_memory_cache_repairs_missing_vk_without_reloading_parameters() {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        return;
+        return true;
     }
+    false
+}
 
+fn tiny_parameter_cache() -> (PoRepConfig, PathBuf, PathBuf) {
     let config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, [42; 32], ApiVersion::V1_2_0);
     let public_params = zigzag_public_params::<ZigZagTree>(&config).unwrap();
     let id = <ZigZagCompound<ZigZagTree, DefaultPieceHasher> as CacheableParameters<
@@ -61,16 +63,63 @@ fn zigzag_memory_cache_repairs_missing_vk_without_reloading_parameters() {
     >>::cache_identifier(&public_params);
     let params_path = parameter_cache::parameter_cache_params_path(&id);
     let vk_path = parameter_cache::parameter_cache_verifying_key_path(&id);
-    let lock_path = params_path.with_extension("params.lock");
     fs::create_dir_all(params_path.parent().unwrap()).unwrap();
 
     // Only the cache/loader is exercised: this tiny fixture needs no PoRep setup.
     let fixture = groth16::generate_random_parameters::<Bls12, _, _>(Multiply, &mut OsRng).unwrap();
     fixture.write(File::create(&params_path).unwrap()).unwrap();
     fixture.vk.write(File::create(&vk_path).unwrap()).unwrap();
+    (config, params_path, vk_path)
+}
+
+#[test]
+fn zigzag_memory_cache_recovers_after_initialization_panic() {
+    if run_in_fresh_cache_process("zigzag_memory_cache_recovers_after_initialization_panic") {
+        return;
+    }
+    let (config, params_path, vk_path) = tiny_parameter_cache();
     let parameter_bytes = fs::read(&params_path).unwrap();
     let vk_bytes = fs::read(&vk_path).unwrap();
-    drop(fixture);
+
+    // Simulate unwinding during initialization, before publishing a source.
+    // The next lookup goes through the production recovery and loader paths.
+    let failed = std::panic::catch_unwind(|| {
+        let cache = ZIGZAG_PARAM_MEMORY_CACHE.lock().unwrap();
+        assert!(cache.is_empty());
+        let _unpublished = ZigZagParameters::open(&params_path, "fixture".into(), false).unwrap();
+        panic!("injected parameter initialization failure");
+    });
+    assert!(failed.is_err());
+    assert!(ZIGZAG_PARAM_MEMORY_CACHE.is_poisoned());
+    let loaded =
+        get_zigzag_params::<ZigZagTree>(&config).expect("retry after initialization panic");
+    assert!(!ZIGZAG_PARAM_MEMORY_CACHE.is_poisoned());
+    assert_eq!(ZIGZAG_PARAM_MEMORY_CACHE.lock().unwrap().len(), 1);
+
+    // A later panic must also retain the already-published, immutable source.
+    let failed = std::panic::catch_unwind(|| {
+        let _cache = ZIGZAG_PARAM_MEMORY_CACHE.lock().unwrap();
+        panic!("injected cache validation failure");
+    });
+    assert!(failed.is_err());
+    let reused = get_zigzag_params::<ZigZagTree>(&config).expect("reuse after validation panic");
+    assert!(!ZIGZAG_PARAM_MEMORY_CACHE.is_poisoned());
+    assert!(Arc::ptr_eq(&loaded, &reused));
+    assert_eq!(fs::read(&params_path).unwrap(), parameter_bytes);
+    assert_eq!(fs::read(&vk_path).unwrap(), vk_bytes);
+}
+
+#[test]
+fn zigzag_memory_cache_repairs_missing_vk_without_reloading_parameters() {
+    if run_in_fresh_cache_process(
+        "zigzag_memory_cache_repairs_missing_vk_without_reloading_parameters",
+    ) {
+        return;
+    }
+    let (config, params_path, vk_path) = tiny_parameter_cache();
+    let lock_path = params_path.with_extension("params.lock");
+    let parameter_bytes = fs::read(&params_path).unwrap();
+    let vk_bytes = fs::read(&vk_path).unwrap();
 
     let loaded = get_zigzag_params::<ZigZagTree>(&config).unwrap();
     assert!(
