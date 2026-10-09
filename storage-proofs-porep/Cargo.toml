@@ -81,6 +81,11 @@ cuda = [
     "neptune/cuda",
     "bellperson/cuda",
 ]
+cuda-supraseal = [
+    "cuda",
+    "storage-proofs-core/cuda-supraseal",
+    "bellperson/cuda-supraseal",
+]
 opencl = [
     "storage-proofs-core/opencl",
     "filecoin-hashers/opencl",

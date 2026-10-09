@@ -471,7 +471,7 @@ fn generate_zigzag_params(porep_config: &PoRepConfig) {
         _,
     >>::blank_circuit(&public_params);
 
-    ZigZagCompound::<ZigZagTree, DefaultPieceHasher>::get_groth_params(
+    ZigZagCompound::<ZigZagTree, DefaultPieceHasher>::get_groth_params_with_cache_status(
         Some(&mut OsRng),
         circuit.clone(),
         &public_params,

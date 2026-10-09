@@ -8,10 +8,13 @@ use lazy_static::lazy_static;
 use log::{info, trace};
 use once_cell::sync::OnceCell;
 use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
+use storage_proofs_core::parameter_cache::{self, CacheableParameters};
 use storage_proofs_core::{
     compound_proof::CompoundProof, merkle::MerkleTreeTrait, parameter_cache::Bls12GrothParams,
 };
 use storage_proofs_porep::stacked::{StackedCompound, StackedDrg};
+use storage_proofs_porep::zigzag::{circuit::ZigZagCircuit, parameters::ZigZagParameters};
 use storage_proofs_porep::zigzag::{circuit::ZigZagCompound, ZigZagDrgPoRep};
 // DefaultPieceHasher is the Sha256 data-tree hasher for ZigZag CommD.
 use storage_proofs_post::fallback::{FallbackPoSt, FallbackPoStCircuit, FallbackPoStCompound};
@@ -27,6 +30,9 @@ use crate::{
     },
     types::{PoRepConfig, PoStConfig, PoStType},
 };
+
+#[cfg(all(test, not(feature = "cuda-supraseal")))]
+mod tests;
 
 pub type Bls12PreparedVerifyingKey = groth16::PreparedVerifyingKey<Bls12>;
 type Bls12ProverSRSKey = groth16::aggregate::ProverSRS<Bls12>;
@@ -64,6 +70,7 @@ const SRS_VERIFIER_IDENTIFIER: &str = "srs-verifying-key";
 
 lazy_static! {
     static ref GROTH_PARAM_MEMORY_CACHE: Mutex<GrothMemCache> = Default::default();
+    static ref ZIGZAG_PARAM_MEMORY_CACHE: Mutex<Cache<ZigZagParameters>> = Default::default();
     static ref VERIFYING_KEY_MEMORY_CACHE: Mutex<VerifyingKeyMemCache> = Default::default();
     static ref SRS_KEY_MEMORY_CACHE: SRSCache<Bls12ProverSRSKey> =
         SRSCache::with_defaults(SRS_IDENTIFIER);
@@ -235,31 +242,43 @@ pub(crate) fn get_stacked_params<Tree: 'static + MerkleTreeTrait>(
 
 pub(crate) fn get_zigzag_params<Tree: 'static + MerkleTreeTrait>(
     porep_config: &PoRepConfig,
-) -> Result<Arc<Bls12GrothParams>> {
+) -> Result<Arc<ZigZagParameters>> {
     let public_params = zigzag_public_params::<Tree>(porep_config)?;
-
-    let parameters_generator = || {
+    let id = <ZigZagCompound<Tree, DefaultPieceHasher> as CacheableParameters<
+        ZigZagCircuit<Tree, DefaultPieceHasher>,
+        _,
+    >>::cache_identifier(&public_params);
+    let path = parameter_cache::parameter_cache_params_path(&id);
+    // Serialize construction. Never build two multi-GiB mapped index vectors
+    // on concurrent cache misses; no SDR cache/type is involved.
+    let mut cache = ZIGZAG_PARAM_MEMORY_CACHE
+        .lock()
+        .expect("poisoned ZigZag cache");
+    if let Some(params) = cache.get(&id) {
+        if params.matches_path(&path) {
+            ZigZagCompound::<Tree, DefaultPieceHasher>::validate_or_repair_parameter_verifying_key(
+                &public_params,
+                params,
+            )?;
+            return Ok(params.clone());
+        }
+    }
+    let params = Arc::new({
         if should_generate_missing_zigzag_params() {
             let mut rng = OsRng;
-            return <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
-                ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
-                _,
-            >>::groth_params::<OsRng>(Some(&mut rng), &public_params);
+            ZigZagCompound::<Tree, DefaultPieceHasher>::groth_parameters(
+                Some(&mut rng),
+                &public_params,
+            )?
+        } else {
+            ZigZagCompound::<Tree, DefaultPieceHasher>::groth_parameters::<OsRng>(
+                None,
+                &public_params,
+            )?
         }
-
-        <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
-            ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
-            _,
-        >>::groth_params::<OsRng>(None, &public_params)
-    };
-
-    lookup_groth_params(
-        format!(
-            "ZIGZAG[{}]",
-            usize::from(porep_config.padded_bytes_amount())
-        ),
-        parameters_generator,
-    )
+    });
+    cache.insert(id, params.clone());
+    Ok(params)
 }
 
 pub(crate) fn get_post_params<Tree: 'static + MerkleTreeTrait>(
@@ -356,30 +375,27 @@ pub(crate) fn get_zigzag_verifying_key<Tree: 'static + MerkleTreeTrait>(
 ) -> Result<Arc<Bls12PreparedVerifyingKey>> {
     let public_params = zigzag_public_params::<Tree>(porep_config)?;
 
-    let vk_generator = || {
-        if should_generate_missing_zigzag_params() {
-            let mut rng = OsRng;
-            let vk = <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
-                ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
-                _,
-            >>::verifying_key::<OsRng>(Some(&mut rng), &public_params)?;
-            return Ok(prepare_verifying_key(&vk));
-        }
-
-        let vk = <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
+    let vk = if should_generate_missing_zigzag_params() {
+        let mut rng = OsRng;
+        <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
             ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
             _,
-        >>::verifying_key::<OsRng>(None, &public_params)?;
-        Ok(prepare_verifying_key(&vk))
+        >>::verifying_key::<OsRng>(Some(&mut rng), &public_params)?
+    } else {
+        <ZigZagCompound<Tree, DefaultPieceHasher> as CompoundProof<
+            ZigZagDrgPoRep<Tree, DefaultPieceHasher>,
+            _,
+        >>::verifying_key::<OsRng>(None, &public_params)?
     };
-
-    lookup_verifying_key(
-        format!(
-            "ZIGZAG[{}]",
-            usize::from(porep_config.padded_bytes_amount())
-        ),
-        vk_generator,
-    )
+    let id = <ZigZagCompound<Tree, DefaultPieceHasher> as CacheableParameters<
+        ZigZagCircuit<Tree, DefaultPieceHasher>,
+        _,
+    >>::cache_identifier(&public_params);
+    let mut encoded = Vec::new();
+    vk.write(&mut encoded)?;
+    // A replaced VK or different full parameter ID cannot reuse a stale key.
+    let identifier = format!("ZIGZAG[{}-{:x}]", id, Sha256::digest(encoded));
+    lookup_verifying_key(identifier, || Ok(prepare_verifying_key(&vk)))
 }
 
 pub(crate) fn get_post_verifying_key<Tree: 'static + MerkleTreeTrait>(

@@ -65,7 +65,7 @@ cuda = [
 ]
 cuda-supraseal = [
     "storage-proofs-core/cuda-supraseal",
-    "storage-proofs-porep/cuda",
+    "storage-proofs-porep/cuda-supraseal",
     "storage-proofs-post/cuda",
     "storage-proofs-update/cuda",
     "bellperson/cuda-supraseal",

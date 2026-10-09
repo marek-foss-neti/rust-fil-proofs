@@ -18,7 +18,7 @@ use group::prime::PrimeCurveAffine;
 use rand_core::{OsRng, RngCore};
 use rayon::prelude::*;
 use storage_proofs_core::{
-    compound_proof::{CircuitComponent, CompoundProof},
+    compound_proof::{self, CircuitComponent, CompoundProof},
     drgraph::Graph,
     error::Result,
     merkle::MerkleTreeTrait,
@@ -31,6 +31,8 @@ use crate::zigzag::{
     circuit::ZigZagCircuit,
     groth16_setup::SetupLimits,
     groth16_setup_disk,
+    measurements::{OperationDetails, OperationGuard},
+    parameters::ZigZagParameters,
     vanilla::{PublicInputs, PublicParams, ZigZagDrgPoRep},
 };
 
@@ -125,7 +127,7 @@ pub fn groth16_batch_size_for_sector_size(sector_size_bytes: u64) -> Result<usiz
     }
 }
 
-impl<Tree: MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, G> {
+impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, G> {
     fn groth16_batch_size(pub_params: &PublicParams<Tree>) -> Result<usize> {
         let sector_size_bytes = u64::try_from(pub_params.graph.size())?
             .checked_mul(NODE_SIZE as u64)
@@ -159,7 +161,7 @@ impl<Tree: MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, G> {
         .map_err(Into::into)
     }
 
-    fn read_cached_parameters(
+    fn read_cached_legacy_parameters(
         path: &std::path::Path,
         vk_path: &std::path::Path,
     ) -> Result<(Bls12GrothParams, groth16::VerifyingKey<Bls12>)> {
@@ -183,26 +185,98 @@ impl<Tree: MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, G> {
         Ok((params, param_vk))
     }
 
+    fn read_cached_parameters(
+        path: &std::path::Path,
+        vk_path: &std::path::Path,
+    ) -> Result<(ZigZagParameters, groth16::VerifyingKey<Bls12>)> {
+        let operation = OperationGuard::enter("groth16_parameter_load", None);
+        groth16_setup_disk::mark_phase("setup_readback")?;
+        let id = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("invalid parameter ID")?;
+        let params = ZigZagParameters::open(path, id.to_owned(), false)?;
+        let vk = params.vk().clone();
+        if vk_path.exists() {
+            ensure!(
+                Self::read_cached_verifying_key(vk_path)? == vk,
+                "ZigZag VK does not match params"
+            );
+        }
+        log::info!(target: "zigzag_parameters", "zigzag_parameters {}", params.diagnostics());
+        operation.finish();
+        Ok((params, vk))
+    }
+
+    pub fn validate_parameter_verifying_key(
+        vk_path: &std::path::Path,
+        params: &ZigZagParameters,
+    ) -> Result<()> {
+        ensure!(
+            Self::read_cached_verifying_key(vk_path)? == *params.vk(),
+            "ZigZag VK does not match cached params"
+        );
+        Ok(())
+    }
+
+    /// Validate a ready VK or publish a missing one from the already-loaded
+    /// source under the same lock as setup. Never reload or regenerate params.
+    pub fn validate_or_repair_parameter_verifying_key(
+        public_params: &PublicParams<Tree>,
+        params: &ZigZagParameters,
+    ) -> Result<()> {
+        Self::get_groth_params_locked(
+            None::<&mut OsRng>,
+            Self::blank_circuit(public_params),
+            public_params,
+            |path, vk_path| {
+                ensure!(
+                    params.matches_path(path),
+                    "ZigZag parameter file changed during VK validation or repair"
+                );
+                if vk_path.exists() {
+                    Self::validate_parameter_verifying_key(vk_path, params)?;
+                }
+                Ok(((), params.vk().clone()))
+            },
+        )?;
+        Ok(())
+    }
+
+    /// ZigZag-only source selection, before allocating any Bellperson index vectors.
+    pub fn groth_parameters<R: RngCore>(
+        rng: Option<&mut R>,
+        public_params: &PublicParams<Tree>,
+    ) -> Result<ZigZagParameters> {
+        Self::get_groth_params_with_cache_status(
+            rng,
+            Self::blank_circuit(public_params),
+            public_params,
+        )
+        .map(|(params, _)| params)
+    }
+
     /// Returns whether published parameters already existed, either on the
     /// lock-free read path or after acquiring the per-cache writer lock.
     pub fn get_groth_params_with_cache_status<C, P, R>(
         rng: Option<&mut R>,
         circuit: C,
         pub_params: &P,
-    ) -> Result<(Bls12GrothParams, bool)>
+    ) -> Result<(ZigZagParameters, bool)>
     where
         C: Circuit<Fr>,
         P: ParameterSetMetadata,
         R: RngCore,
     {
-        Self::get_groth_params_locked(rng, circuit, pub_params)
+        Self::get_groth_params_locked(rng, circuit, pub_params, Self::read_cached_parameters)
     }
 
-    fn get_groth_params_locked<C, P, R>(
+    fn get_groth_params_locked<C, P, R, T>(
         rng: Option<&mut R>,
         circuit: C,
         pub_params: &P,
-    ) -> Result<(Bls12GrothParams, bool)>
+        read: impl Fn(&std::path::Path, &std::path::Path) -> Result<(T, groth16::VerifyingKey<Bls12>)>,
+    ) -> Result<(T, bool)>
     where
         C: Circuit<Fr>,
         P: ParameterSetMetadata,
@@ -219,7 +293,7 @@ impl<Tree: MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, G> {
         // Published cache entries are immutable. Reading both files needs no
         // writable directory or writable per-cache lock.
         if path.is_file() && vk_path.is_file() {
-            return Ok((Self::read_cached_parameters(&path, &vk_path)?.0, true));
+            return Ok((read(&path, &vk_path)?.0, true));
         }
 
         fs::create_dir_all(parent)?;
@@ -301,7 +375,7 @@ impl<Tree: MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, G> {
                 write_started.elapsed().as_millis()
             );
         }
-        let (params, param_vk) = Self::read_cached_parameters(&path, &vk_path)?;
+        let (params, param_vk) = read(&path, &vk_path)?;
         if !vk_path.exists() {
             let mut pending_vk = tempfile::NamedTempFile::new_in(publication.path())?;
             param_vk.write(&mut pending_vk)?;
@@ -315,8 +389,12 @@ impl<Tree: MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, G> {
     }
 }
 
-impl<C: Circuit<Fr>, P: ParameterSetMetadata, Tree: MerkleTreeTrait, G: 'static + Hasher>
-    CacheableParameters<C, P> for ZigZagCompound<Tree, G>
+impl<
+        C: Circuit<Fr>,
+        P: ParameterSetMetadata,
+        Tree: 'static + MerkleTreeTrait,
+        G: 'static + Hasher,
+    > CacheableParameters<C, P> for ZigZagCompound<Tree, G>
 {
     fn cache_prefix() -> String {
         format!(
@@ -331,7 +409,15 @@ impl<C: Circuit<Fr>, P: ParameterSetMetadata, Tree: MerkleTreeTrait, G: 'static 
         circuit: C,
         pub_params: &P,
     ) -> Result<Bls12GrothParams> {
-        Self::get_groth_params_with_cache_status(rng, circuit, pub_params).map(|(params, _)| params)
+        // Compatibility for the shared CompoundProof trait's fixed parameter
+        // type. Production ZigZag APIs use groth_parameters instead.
+        Self::get_groth_params_locked(
+            rng,
+            circuit,
+            pub_params,
+            Self::read_cached_legacy_parameters,
+        )
+        .map(|(params, _)| params)
     }
 
     fn get_verifying_key<R: RngCore>(
@@ -351,6 +437,154 @@ impl<C: Circuit<Fr>, P: ParameterSetMetadata, Tree: MerkleTreeTrait, G: 'static 
     }
 }
 
+impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, G> {
+    pub fn circuit_proofs_with_parameters<'a>(
+        pub_in: &PublicInputs<<Tree::Hasher as Hasher>::Domain, G::Domain>,
+        vanilla_proofs: Vec<<ZigZagDrgPoRep<Tree, G> as ProofScheme<'a>>::Proof>,
+        pub_params: &PublicParams<Tree>,
+        groth_params: &ZigZagParameters,
+        priority: bool,
+    ) -> Result<Vec<groth16::Proof<Bls12>>> {
+        #[cfg(not(feature = "cuda-supraseal"))]
+        {
+            Self::circuit_proofs_from_source(
+                pub_in,
+                vanilla_proofs,
+                pub_params,
+                groth_params,
+                priority,
+            )
+        }
+        #[cfg(feature = "cuda-supraseal")]
+        {
+            Self::circuit_proofs_from_supraseal(
+                pub_in,
+                vanilla_proofs,
+                pub_params,
+                groth_params.supraseal(),
+                priority,
+            )
+        }
+    }
+
+    pub fn prove_with_parameters<'a>(
+        pub_params: &compound_proof::PublicParams<'a, ZigZagDrgPoRep<Tree, G>>,
+        pub_in: &PublicInputs<<Tree::Hasher as Hasher>::Domain, G::Domain>,
+        priv_in: &<ZigZagDrgPoRep<Tree, G> as ProofScheme<'a>>::PrivateInputs,
+        groth_params: &ZigZagParameters,
+    ) -> Result<Vec<groth16::Proof<Bls12>>> {
+        let partitions = Self::partition_count(pub_params);
+        ensure!(partitions > 0, "There must be partitions");
+        let vanilla = ZigZagDrgPoRep::<Tree, G>::prove_all_partitions(
+            &pub_params.vanilla_params,
+            pub_in,
+            priv_in,
+            partitions,
+        )?;
+        ensure!(
+            ZigZagDrgPoRep::<Tree, G>::verify_all_partitions(
+                &pub_params.vanilla_params,
+                pub_in,
+                &vanilla
+            )?,
+            "sanity check failed"
+        );
+        Self::circuit_proofs_with_parameters(
+            pub_in,
+            vanilla,
+            &pub_params.vanilla_params,
+            groth_params,
+            pub_params.priority,
+        )
+    }
+
+    #[cfg(not(feature = "cuda-supraseal"))]
+    fn circuit_proofs_from_source<'a, P: groth16::ParameterSource<Bls12> + Copy>(
+        pub_in: &PublicInputs<<Tree::Hasher as Hasher>::Domain, G::Domain>,
+        vanilla_proofs: Vec<<ZigZagDrgPoRep<Tree, G> as ProofScheme<'a>>::Proof>,
+        pub_params: &PublicParams<Tree>,
+        groth_params: P,
+        priority: bool,
+    ) -> Result<Vec<groth16::Proof<Bls12>>> {
+        let create = if priority {
+            create_random_proof_batch_in_priority
+        } else {
+            create_random_proof_batch
+        };
+        let mut rng = OsRng;
+        Self::circuit_proofs_batched(pub_in, vanilla_proofs, pub_params, |batch| {
+            Ok(create(batch, groth_params, &mut rng)?)
+        })
+    }
+
+    #[cfg(feature = "cuda-supraseal")]
+    fn circuit_proofs_from_supraseal<'a>(
+        pub_in: &PublicInputs<<Tree::Hasher as Hasher>::Domain, G::Domain>,
+        vanilla_proofs: Vec<<ZigZagDrgPoRep<Tree, G> as ProofScheme<'a>>::Proof>,
+        pub_params: &PublicParams<Tree>,
+        groth_params: &groth16::SuprasealParameters<Bls12>,
+        priority: bool,
+    ) -> Result<Vec<groth16::Proof<Bls12>>> {
+        let create = if priority {
+            create_random_proof_batch_in_priority
+        } else {
+            create_random_proof_batch
+        };
+        let mut rng = OsRng;
+        Self::circuit_proofs_batched(pub_in, vanilla_proofs, pub_params, |batch| {
+            Ok(create(batch, groth_params, &mut rng)?)
+        })
+    }
+
+    fn circuit_proofs_batched<'a>(
+        pub_in: &PublicInputs<<Tree::Hasher as Hasher>::Domain, G::Domain>,
+        vanilla_proofs: Vec<<ZigZagDrgPoRep<Tree, G> as ProofScheme<'a>>::Proof>,
+        pub_params: &PublicParams<Tree>,
+        mut create_batch: impl FnMut(Vec<ZigZagCircuit<Tree, G>>) -> Result<Vec<groth16::Proof<Bls12>>>,
+    ) -> Result<Vec<groth16::Proof<Bls12>>> {
+        ensure!(!vanilla_proofs.is_empty(), "missing ZigZag vanilla proofs");
+        let batch_size = Self::groth16_batch_size(pub_params)?;
+        let proof_count = vanilla_proofs.len();
+        let mut result = Vec::with_capacity(proof_count);
+        let mut partitions = vanilla_proofs.into_iter().enumerate();
+        while result.len() < proof_count {
+            let operation = OperationGuard::enter_with_details(
+                "groth16_batch",
+                None,
+                OperationDetails {
+                    partition_start: Some(result.len()),
+                    partition_count: Some(batch_size.min(proof_count - result.len())),
+                    ..Default::default()
+                },
+            );
+            let batch: Vec<_> = partitions
+                .by_ref()
+                .take(batch_size)
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(k, vanilla)| {
+                    Self::circuit(pub_in, Default::default(), &vanilla, pub_params, Some(k))
+                })
+                .collect::<Result<_>>()?;
+            let batch_len = batch.len();
+            ensure!(batch_len > 0, "missing ZigZag circuits for next batch");
+            let proofs = create_batch(batch)?;
+            ensure!(
+                proofs.len() == batch_len,
+                "ZigZag Groth16 proof count differs from circuit batch"
+            );
+            // Bellperson has returned and released this batch's circuits/query builders.
+            operation.finish();
+            for proof in proofs {
+                let mut bytes = Vec::new();
+                proof.write(&mut bytes)?;
+                result.push(groth16::Proof::<Bls12>::read(&bytes[..])?);
+            }
+        }
+        Ok(result)
+    }
+}
+
 impl<'a, Tree, G> CompoundProof<'a, ZigZagDrgPoRep<Tree, G>, ZigZagCircuit<Tree, G>>
     for ZigZagCompound<Tree, G>
 where
@@ -364,41 +598,26 @@ where
         groth_params: &Bls12GrothParams,
         priority: bool,
     ) -> Result<Vec<groth16::Proof<Bls12>>> {
-        ensure!(!vanilla_proofs.is_empty(), "missing ZigZag vanilla proofs");
-        let batch_size = Self::groth16_batch_size(pub_params)?;
-        let proof_count = vanilla_proofs.len();
-        let mut result = Vec::with_capacity(proof_count);
-        let create = if priority {
-            create_random_proof_batch_in_priority
-        } else {
-            create_random_proof_batch
-        };
-        let mut rng = OsRng;
-        let mut partitions = vanilla_proofs.into_iter().enumerate();
-        while result.len() < proof_count {
-            let batch: Vec<_> = partitions
-                .by_ref()
-                .take(batch_size)
-                .collect::<Vec<_>>()
-                .into_par_iter()
-                .map(|(k, vanilla)| {
-                    Self::circuit(pub_in, Default::default(), &vanilla, pub_params, Some(k))
-                })
-                .collect::<Result<_>>()?;
-            let batch_len = batch.len();
-            ensure!(batch_len > 0, "missing ZigZag circuits for next batch");
-            let proofs = create(batch, groth_params, &mut rng)?;
-            ensure!(
-                proofs.len() == batch_len,
-                "ZigZag Groth16 proof count differs from circuit batch"
-            );
-            for proof in proofs {
-                let mut bytes = Vec::new();
-                proof.write(&mut bytes)?;
-                result.push(groth16::Proof::<Bls12>::read(&bytes[..])?);
-            }
+        #[cfg(not(feature = "cuda-supraseal"))]
+        {
+            Self::circuit_proofs_from_source(
+                pub_in,
+                vanilla_proofs,
+                pub_params,
+                groth_params,
+                priority,
+            )
         }
-        Ok(result)
+        #[cfg(feature = "cuda-supraseal")]
+        {
+            Self::circuit_proofs_from_supraseal(
+                pub_in,
+                vanilla_proofs,
+                pub_params,
+                groth_params,
+                priority,
+            )
+        }
     }
 
     fn generate_public_inputs(
@@ -685,6 +904,28 @@ mod tests {
             "ready cache must not recreate writer lock"
         );
 
+        // A ready cache must validate the VK instead of silently accepting a
+        // replaced key or regenerating parameters to hide the mismatch.
+        let mut wrong_vk =
+            ZigZagCompound::<ZZTree, Piece>::read_parameter_verifying_key(&params_path)
+                .expect("read VK");
+        wrong_vk.ic.pop();
+        wrong_vk
+            .write(File::create(&vk_path).expect("replace VK"))
+            .expect("write wrong VK");
+        assert!(
+            ZigZagCompound::<ZZTree, Piece>::get_groth_params_with_cache_status(
+                None::<&mut XorShiftRng>,
+                CacheStatusCircuit,
+                &metadata,
+            )
+            .is_err()
+        );
+        assert!(
+            !lock_path.exists(),
+            "invalid ready cache must not start generation"
+        );
+
         fs::remove_file(params_path).expect("remove params");
         fs::remove_file(vk_path).expect("remove VK");
     }
@@ -757,13 +998,13 @@ mod tests {
             assert!(cs.verify(&inputs), "generated public inputs do not verify");
         }
 
-        let groth_params = ZigZagCompound::<ZZTree, Piece>::groth_params(
+        let groth_params = ZigZagCompound::<ZZTree, Piece>::groth_parameters(
             Some(&mut rng),
             &public_params.vanilla_params,
         )
         .expect("groth param generation failed");
 
-        let proofs = ZigZagCompound::<ZZTree, Piece>::prove(
+        let proofs = ZigZagCompound::<ZZTree, Piece>::prove_with_parameters(
             &public_params,
             &public_inputs,
             &private_inputs,
