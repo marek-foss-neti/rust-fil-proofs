@@ -267,9 +267,20 @@ impl CompactParameters {
         family: usize,
     ) -> Result<Arc<Vec<C>>, SynthesisError> {
         let descriptor = self.layout.families[family];
-        let points = (0..descriptor.points)
-            .into_par_iter()
-            .map(|index| {
+        // Collecting a parallel iterator of Results loses its exact length and
+        // builds intermediate vectors before merging them. For multi-GiB query
+        // families, both the temporary copies and retained allocator arenas are
+        // costly. Decode into one initialized destination instead. Initialization
+        // also makes early errors safe without partially initialized allocations.
+        let mut points = Vec::new();
+        points
+            .try_reserve_exact(descriptor.points)
+            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+        points.resize(descriptor.points, C::identity());
+        points
+            .par_iter_mut()
+            .enumerate()
+            .try_for_each(|(index, slot)| -> io::Result<()> {
                 let range = descriptor.range(index)?;
                 let bytes = self
                     .mmap
@@ -289,9 +300,9 @@ impl CompactParameters {
                 if bool::from(point.is_identity()) {
                     return Err(invalid("point at infinity"));
                 }
-                Ok(point)
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+                *slot = point;
+                Ok(())
+            })?;
         Ok(Arc::new(points))
     }
 

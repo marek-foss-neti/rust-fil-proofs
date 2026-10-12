@@ -74,6 +74,53 @@ fn compact_matches_legacy_all_families_splits_and_reopen() {
 }
 
 #[test]
+fn parallel_decode_preserves_order_and_rejects_late_invalid_points() {
+    let (mut file, mut expected) = fixture();
+    expected.h = Arc::new(
+        (0..4097)
+            .map(|i| expected.h[i % expected.h.len()])
+            .collect(),
+    );
+    expected.b_g2 = Arc::new(
+        (0..4097)
+            .map(|i| expected.b_g2[i % expected.b_g2.len()])
+            .collect(),
+    );
+    file.as_file_mut().set_len(0).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    expected.write(&mut file).unwrap();
+    file.as_file().sync_all().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        for checked in [false, true] {
+            let compact = CompactParameters::open(file.path(), "parallel".into(), checked).unwrap();
+            assert_eq!((&compact).get_h(4097).unwrap().0, expected.h);
+            assert_eq!((&compact).get_b_g2(1, 4096).unwrap().0 .0, expected.b_g2);
+        }
+        let original = std::fs::read(file.path()).unwrap();
+        let layout = ParameterLayout::parse(&original).unwrap();
+        for family in [0, 4] {
+            let mut bytes = original.clone();
+            bytes[layout.families[family].range(4096).unwrap()].fill(0);
+            let bad = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(bad.path(), bytes).unwrap();
+            for checked in [false, true] {
+                let compact =
+                    CompactParameters::open(bad.path(), "invalid".into(), checked).unwrap();
+                if family == 0 {
+                    assert!((&compact).get_h(4097).is_err());
+                } else {
+                    assert!((&compact).get_b_g2(1, 4096).is_err());
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn legacy_reader_finishes_while_compact_source_remains_alive() {
     let (file, expected) = fixture();
     let compact = CompactParameters::open(file.path(), "fixture".into(), true).unwrap();
