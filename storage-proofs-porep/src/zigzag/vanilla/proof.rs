@@ -17,6 +17,7 @@ use storage_proofs_core::{
 
 use crate::zigzag::cache_policy::{discard_file, CachePolicy};
 use crate::zigzag::measurements::OperationGuard;
+use crate::zigzag::merkle_builder::{build_tree_r, TreeRBuilder};
 use crate::{
     encode,
     zigzag::vanilla::{
@@ -178,6 +179,7 @@ where
         let mut layer_comm_rs = Vec::with_capacity(layers);
         let mut current_graph = graph.clone();
         let cache_policy = CachePolicy::from_env()?;
+        let tree_r_builder = TreeRBuilder::from_env()?;
 
         for layer in 0..layers {
             let operation = OperationGuard::enter("encode", Some(layer));
@@ -189,7 +191,13 @@ where
             let started = Instant::now();
             let tree_r_config =
                 cache_path.map(|p| StoreConfig::new(p, format!("zigzag-tree-r-{layer}"), 0));
-            let tree_r = create_base_merkle_tree::<Tree>(tree_r_config.clone(), leaves, data)?;
+            let tree_r = build_tree_r::<Tree>(
+                tree_r_builder,
+                tree_r_config.clone(),
+                leaves,
+                data,
+                layer,
+            )?;
             if cache_policy.tree_r_dontneed {
                 if let Some(config) = tree_r_config {
                     let path = StoreConfig::data_path(&config.path, &config.id);

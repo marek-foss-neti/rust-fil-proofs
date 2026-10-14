@@ -12,6 +12,7 @@ pub mod circuit;
 pub(crate) mod groth16_setup;
 pub(crate) mod groth16_setup_disk;
 pub mod measurements;
+pub mod merkle_builder;
 pub mod parameters;
 pub(crate) mod vanilla;
 
