@@ -447,13 +447,12 @@ impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, 
     ) -> Result<Vec<groth16::Proof<Bls12>>> {
         #[cfg(not(feature = "cuda-supraseal"))]
         {
-            Self::circuit_proofs_from_source(
-                pub_in,
-                vanilla_proofs,
-                pub_params,
-                groth_params,
-                priority,
-            )
+            use crate::zigzag::parameters::query_cache::{CachedParameters, QueryCacheConfig};
+            // This source belongs to one C2, never the global parameter cache.
+            // Retention spans normal batches; errors keep Bellperson's existing
+            // cleanup semantics for outstanding CPU tasks and their own Arcs.
+            let source = CachedParameters::new(groth_params, QueryCacheConfig::from_env()?)?;
+            Self::circuit_proofs_from_source(pub_in, vanilla_proofs, pub_params, &source, priority)
         }
         #[cfg(feature = "cuda-supraseal")]
         {
@@ -565,6 +564,7 @@ impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, 
                     ..Default::default()
                 },
             );
+            let preparation = OperationGuard::enter("groth16_circuit_prepare", None);
             let batch: Vec<_> = partitions
                 .by_ref()
                 .take(batch_size)
@@ -574,6 +574,7 @@ impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, 
                     Self::circuit(pub_in, Default::default(), &vanilla, pub_params, Some(k))
                 })
                 .collect::<Result<_>>()?;
+            preparation.finish();
             let batch_len = batch.len();
             ensure!(batch_len > 0, "missing ZigZag circuits for next batch");
             let proofs = create_batch(batch)?;

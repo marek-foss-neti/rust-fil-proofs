@@ -30,6 +30,9 @@ use super::measurements::{OperationDetails, OperationGuard};
 #[cfg(all(test, not(feature = "cuda-supraseal")))]
 mod tests;
 
+#[cfg(not(feature = "cuda-supraseal"))]
+pub mod query_cache;
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }

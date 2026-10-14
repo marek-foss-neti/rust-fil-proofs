@@ -2,7 +2,7 @@ use super::*;
 use blstrs::Scalar;
 use group::{Curve, Group};
 
-fn fixture() -> (
+pub(super) fn fixture() -> (
     tempfile::NamedTempFile,
     bellperson::groth16::Parameters<Bls12>,
 ) {
@@ -345,9 +345,23 @@ fn fresh_compact_source_proves_with_existing_bellperson_params() {
                 std::mem::size_of::<[QueryFamily; 5]>()
             );
         }
+        let config = query_cache::QueryCacheConfig {
+            requested_bytes: 1 << 20,
+            reserve_bytes: 1,
+            memory_limit_bytes: Some((1 << 20) + 1),
+            effective_bytes: 1 << 20,
+        };
+        let cached = query_cache::CachedParameters::new(&parameters, config).unwrap();
+        let mut warm_rng = rng.clone();
+        bellperson::groth16::create_random_proof_batch(
+            vec![Multiply, Multiply],
+            &cached,
+            &mut warm_rng,
+        )
+        .unwrap();
         let proofs = bellperson::groth16::create_random_proof_batch(
             vec![Multiply, Multiply],
-            &parameters,
+            &cached,
             &mut rng,
         )
         .unwrap();
@@ -392,8 +406,21 @@ fn fresh_compact_source_proves_with_existing_bellperson_params() {
             &mut reference_rng,
         )
         .unwrap();
+        let source = ZigZagParameters::Compact(reopened);
+        let config = query_cache::QueryCacheConfig {
+            requested_bytes: 1 << 20,
+            reserve_bytes: 1,
+            memory_limit_bytes: Some((1 << 20) + 1),
+            effective_bytes: 1 << 20,
+        };
+        let cached = query_cache::CachedParameters::new(&source, config).unwrap();
+        // Warm the cache with the same valid proof, then compare a cache hit
+        // against Bellperson using identical randomness and existing params.
+        let mut warm_rng = rng.clone();
+        bellperson::groth16::create_random_proof_batch(vec![Multiply], &cached, &mut warm_rng)
+            .unwrap();
         let proofs =
-            bellperson::groth16::create_random_proof_batch(vec![Multiply], &reopened, &mut rng)
+            bellperson::groth16::create_random_proof_batch(vec![Multiply], &cached, &mut rng)
                 .unwrap();
         let mut expected_bytes = Vec::new();
         let mut actual_bytes = Vec::new();
