@@ -63,6 +63,10 @@ impl TreeRBuilder {
 
 /// Only the actual ZigZag disk-tree shape uses the specialized path. In-memory
 /// and other generic callers retain the shared builder, without changing arity.
+pub(crate) fn supports_binary<Tree: 'static + MerkleTreeTrait>() -> bool {
+    cfg!(target_os = "linux") && TypeId::of::<Tree>() == TypeId::of::<BinaryTree>()
+}
+
 pub(crate) fn build_tree_r<Tree: 'static + MerkleTreeTrait>(
     builder: TreeRBuilder,
     config: Option<StoreConfig>,
@@ -70,11 +74,7 @@ pub(crate) fn build_tree_r<Tree: 'static + MerkleTreeTrait>(
     data: &[u8],
     layer: usize,
 ) -> Result<Tree> {
-    if builder == TreeRBuilder::Legacy
-        || !cfg!(target_os = "linux")
-        || config.is_none()
-        || TypeId::of::<Tree>() != TypeId::of::<BinaryTree>()
-    {
+    if builder == TreeRBuilder::Legacy || config.is_none() || !supports_binary::<Tree>() {
         log::info!(target: "zigzag_merkle", "zigzag_merkle {}", serde_json::json!({
             "builder": "legacy", "layer": layer,
             "reason": if builder == TreeRBuilder::Legacy { "explicit reference" } else { "unsupported platform, shape or non-disk request" },
@@ -147,11 +147,29 @@ impl LeafSnapshot {
         layer: usize,
         cancelled: &AtomicBool,
     ) -> Result<Self> {
-        let geometry = Geometry::new(leaves)?;
         ensure!(
-            data.len() == geometry.leaf_bytes,
+            data.len() == Geometry::new(leaves)?.leaf_bytes,
             "TreeR leaf data length mismatch"
         );
+        Self::capture_with(config, leaves, layer, cancelled, |file, expected| {
+            for (index, chunk) in data.chunks(SNAPSHOT_CHUNK_BYTES).enumerate() {
+                check_cancelled(cancelled)?;
+                write_all_at(file, chunk, (index * SNAPSHOT_CHUNK_BYTES) as u64)?;
+            }
+            Ok(expected)
+        })
+    }
+
+    /// The callback must write each leaf exactly once before returning its byte count.
+    /// Only a successful complete capture can become input to the internal-node builder.
+    pub(crate) fn capture_with(
+        config: StoreConfig,
+        leaves: usize,
+        layer: usize,
+        cancelled: &AtomicBool,
+        capture: impl FnOnce(&File, usize) -> Result<usize>,
+    ) -> Result<Self> {
+        let geometry = Geometry::new(leaves)?;
         ensure!(
             config.rows_to_discard == 0,
             "binary TreeR must retain every row"
@@ -175,10 +193,11 @@ impl LeafSnapshot {
             .prefix(".zigzag-tree-r-")
             .tempfile_in(&config.path)?;
         reserve_file(file.as_file(), geometry.file_bytes).context("preallocate TreeR store")?;
-        for (index, chunk) in data.chunks(SNAPSHOT_CHUNK_BYTES).enumerate() {
-            check_cancelled(cancelled)?;
-            write_all_at(file.as_file(), chunk, (index * SNAPSHOT_CHUNK_BYTES) as u64)?;
-        }
+        ensure!(
+            capture(file.as_file(), geometry.leaf_bytes)? == geometry.leaf_bytes,
+            "incomplete TreeR leaf snapshot"
+        );
+        check_cancelled(cancelled)?;
         operation.finish();
         Ok(Self {
             file,
@@ -188,13 +207,24 @@ impl LeafSnapshot {
     }
 
     pub(crate) fn build(self, layer: usize, cancelled: &AtomicBool) -> Result<CompletedTree> {
+        self.build_with_dirty_limit(layer, cancelled, None)
+    }
+
+    pub(crate) fn build_with_dirty_limit(
+        self,
+        layer: usize,
+        cancelled: &AtomicBool,
+        dirty_limit: Option<usize>,
+    ) -> Result<CompletedTree> {
         let operation = OperationGuard::enter("tree_r_build", Some(layer));
-        let (root, stats) = build_levels(
+        let dirty = dirty_limit.map(DirtyBudget::new).transpose()?;
+        let (root, stats) = build_levels_with_dirty_budget(
             self.file.as_file(),
             self.geometry,
             CHUNK_PAIRS,
             MAX_WORKERS,
             cancelled,
+            dirty.as_ref(),
         )?;
         check_cancelled(cancelled)?;
         operation.finish();
@@ -318,12 +348,16 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
 
 // Positioned bounded I/O avoids writable mmap entirely. Short writes, EINTR,
 // ENOSPC and read failures remain ordinary Results, including after reservation.
-trait PositionedIo: Sync {
+pub(crate) trait PositionedIo: Sync {
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
     fn write_at(&self, buffer: &[u8], offset: u64) -> io::Result<usize>;
     fn start_writeback(&self, offset: u64, bytes: u64) -> io::Result<()>;
+    fn sync_data(&self) -> io::Result<()>;
 }
 impl PositionedIo for File {
+    fn sync_data(&self) -> io::Result<()> {
+        File::sync_data(self)
+    }
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
         FileExt::read_at(self, buffer, offset)
     }
@@ -393,7 +427,11 @@ fn read_exact_at(io: &impl PositionedIo, mut bytes: &mut [u8], mut offset: u64) 
     Ok(())
 }
 
-fn write_all_at(io: &impl PositionedIo, mut bytes: &[u8], mut offset: u64) -> io::Result<()> {
+pub(crate) fn write_all_at(
+    io: &impl PositionedIo,
+    mut bytes: &[u8],
+    mut offset: u64,
+) -> io::Result<()> {
     while !bytes.is_empty() {
         match io.write_at(bytes, offset) {
             Ok(0) => {
@@ -411,6 +449,37 @@ fn write_all_at(io: &impl PositionedIo, mut bytes: &[u8], mut offset: u64) -> io
         }
     }
     Ok(())
+}
+
+/// Bounds builder-owned dirty writes. Writes and a periodic sync_data share the
+/// lock, so no worker can keep dirtying this file while another flushes it.
+/// Clean page cache and the active replica are outside this per-store bound.
+pub(crate) struct DirtyBudget {
+    limit: usize,
+    bytes: Mutex<usize>,
+}
+impl DirtyBudget {
+    pub(crate) fn new(limit: usize) -> Result<Self> {
+        ensure!(limit > 0, "empty TreeR dirty budget");
+        Ok(Self {
+            limit,
+            bytes: Mutex::new(0),
+        })
+    }
+    pub(crate) fn write(&self, io: &impl PositionedIo, data: &[u8], offset: u64) -> Result<()> {
+        ensure!(data.len() <= self.limit, "TreeR write exceeds dirty budget");
+        let mut bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *bytes > self.limit - data.len() {
+            io.sync_data().context("flush TreeR dirty budget")?;
+            *bytes = 0;
+        }
+        write_all_at(io, data, offset)?;
+        *bytes += data.len();
+        Ok(())
+    }
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -453,6 +522,7 @@ impl Worker {
         count: usize,
         read: u64,
         write: u64,
+        dirty: Option<&DirtyBudget>,
     ) -> Result<()> {
         let started = Instant::now();
         read_exact_at(io, &mut self.input[..count * 64], read)?;
@@ -485,7 +555,11 @@ impl Worker {
         }
         self.stats.hash_serialize_ns += started.elapsed().as_nanos() as u64;
         let started = Instant::now();
-        write_all_at(io, &self.output[..count * 32], write)?;
+        if let Some(dirty) = dirty {
+            dirty.write(io, &self.output[..count * 32], write)?;
+        } else {
+            write_all_at(io, &self.output[..count * 32], write)?;
+        }
         self.stats.write_ns += started.elapsed().as_nanos() as u64;
         self.stats.pairs += count as u64;
         self.stats.read_bytes += (count * 64) as u64;
@@ -494,12 +568,24 @@ impl Worker {
     }
 }
 
+#[cfg(test)]
 fn build_levels(
     io: &impl PositionedIo,
     geometry: Geometry,
     chunk_pairs: usize,
     max_workers: usize,
     cancelled: &AtomicBool,
+) -> Result<([u8; 32], BuildStats)> {
+    build_levels_with_dirty_budget(io, geometry, chunk_pairs, max_workers, cancelled, None)
+}
+
+fn build_levels_with_dirty_budget(
+    io: &impl PositionedIo,
+    geometry: Geometry,
+    chunk_pairs: usize,
+    max_workers: usize,
+    cancelled: &AtomicBool,
+    dirty: Option<&DirtyBudget>,
 ) -> Result<([u8; 32], BuildStats)> {
     // Linux may block even when submitting writeback without WAIT flags. One
     // scoped thread overlaps that wait with hashing; a one-entry queue bounds
@@ -523,7 +609,15 @@ fn build_levels(
                 }
                 Ok(elapsed)
             })?;
-        let result = build_levels_inner(io, geometry, chunk_pairs, max_workers, cancelled, &sender);
+        let result = build_levels_inner(
+            io,
+            geometry,
+            chunk_pairs,
+            max_workers,
+            cancelled,
+            &sender,
+            dirty,
+        );
         if result.is_err() {
             cancelled.store(true, Ordering::Relaxed);
         }
@@ -546,6 +640,7 @@ fn build_levels_inner(
     max_workers: usize,
     cancelled: &AtomicBool,
     writeback: &std::sync::mpsc::SyncSender<(u64, u64)>,
+    dirty: Option<&DirtyBudget>,
 ) -> Result<([u8; 32], BuildStats)> {
     check_cancelled(cancelled)?;
     ensure!(
@@ -582,7 +677,7 @@ fn build_levels_inner(
                 let count = capacity.min(parents - first);
                 let read = ((read_start + first * 2) * NODE_BYTES) as u64;
                 let write = ((write_start + first) * NODE_BYTES) as u64;
-                if let Err(failure) = worker.process(io, count, read, write) {
+                if let Err(failure) = worker.process(io, count, read, write, dirty) {
                     let mut first_error = error
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -175,6 +175,67 @@ impl EncodeData {
     }
 }
 
+/// A completed range is borrowed only during the callback. Sinks must copy it
+/// into owned storage before returning; no replica pointer may cross a thread.
+pub(crate) trait EncodedSink {
+    fn capture(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
+}
+
+#[derive(Default)]
+pub(crate) struct EncodeOutput<'a> {
+    cancelled: Option<&'a AtomicBool>,
+    sink: Option<&'a mut dyn EncodedSink>,
+    chunk_nodes: usize,
+    captured_nodes: usize,
+}
+impl<'a> EncodeOutput<'a> {
+    pub(crate) fn new(
+        cancelled: &'a AtomicBool,
+        sink: Option<&'a mut dyn EncodedSink>,
+        chunk_nodes: usize,
+    ) -> Result<Self> {
+        ensure!(chunk_nodes > 0, "empty encoded chunk");
+        Ok(Self {
+            cancelled: Some(cancelled),
+            sink,
+            chunk_nodes,
+            captured_nodes: 0,
+        })
+    }
+    fn check_cancelled(&self) -> Result<()> {
+        ensure!(
+            !self
+                .cancelled
+                .is_some_and(|flag| flag.load(Ordering::Acquire)),
+            "ZigZag layer pipeline cancelled"
+        );
+        Ok(())
+    }
+    fn range(&self, position: usize, nodes: usize, forward: bool) -> Option<(usize, usize)> {
+        if self.sink.is_none()
+            || (position + 1 != nodes && position + 1 - self.captured_nodes < self.chunk_nodes)
+        {
+            return None;
+        }
+        let count = position + 1 - self.captured_nodes;
+        let first = if forward {
+            self.captured_nodes
+        } else {
+            nodes - position - 1
+        };
+        Some((first * NODE_SIZE, count * NODE_SIZE))
+    }
+    fn capture(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.check_cancelled()?;
+        self.sink
+            .as_mut()
+            .expect("encoded sink")
+            .capture(offset, bytes)?;
+        self.captured_nodes += bytes.len() / NODE_SIZE;
+        Ok(())
+    }
+}
+
 /// Opens or generates the optional on-disk ZigZag parent table for `graph`.
 ///
 /// This is primarily useful for benchmarks and process startup warmups, so the expensive table
@@ -211,25 +272,69 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
+    encode_with_output(graph, replica_id, data, &mut EncodeOutput::default())
+}
+
+pub(crate) fn encode_with_output<H, G>(
+    graph: &ZigZagGraph<H, G>,
+    replica_id: &H::Domain,
+    data: &mut [u8],
+    output: &mut EncodeOutput<'_>,
+) -> Result<()>
+where
+    H: Hasher,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+{
+    output.check_cancelled()?;
     ensure_graph_data_len(graph, data)?;
 
     if SETTINGS.zigzag_multicore_encode && graph.size() > 1 {
-        encode_multicore(graph, SETTINGS.use_zigzag_parent_cache, replica_id, data)
+        encode_multicore_with_config_and_output(
+            graph,
+            SETTINGS.use_zigzag_parent_cache,
+            replica_id,
+            data,
+            EncodePipelineConfig::from_settings(graph.size())?,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            output,
+        )
     } else {
         let parent_table = if SETTINGS.use_zigzag_parent_cache {
             Some(ZigZagParentTable::new_for_encode(graph)?)
         } else {
             None
         };
-        encode_sequential(graph, parent_table, replica_id, data)
+        encode_sequential_with_output(graph, parent_table, replica_id, data, output)
     }
 }
 
+#[cfg(test)]
 fn encode_sequential<H, G>(
+    graph: &ZigZagGraph<H, G>,
+    parent_table: Option<ZigZagParentTable>,
+    replica_id: &H::Domain,
+    data: &mut [u8],
+) -> Result<()>
+where
+    H: Hasher,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+{
+    encode_sequential_with_output(
+        graph,
+        parent_table,
+        replica_id,
+        data,
+        &mut EncodeOutput::default(),
+    )
+}
+
+fn encode_sequential_with_output<H, G>(
     graph: &ZigZagGraph<H, G>,
     mut parent_table: Option<ZigZagParentTable>,
     replica_id: &H::Domain,
     data: &mut [u8],
+    output: &mut EncodeOutput<'_>,
 ) -> Result<()>
 where
     H: Hasher,
@@ -243,6 +348,9 @@ where
     let mut parents = vec![0u32; graph.degree()];
     let mut key_scratch = KeyScratch::new(graph.degree());
     for n in 0..graph.size() {
+        if n & 1023 == 0 {
+            output.check_cancelled()?;
+        }
         let node = traversal_node(graph, n);
 
         fill_parents(graph, &mut parent_table, node, &mut parents)?;
@@ -255,6 +363,9 @@ where
         let start = data_at_node_offset(node);
         let end = start + NODE_SIZE;
         encoded.write_bytes(&mut data[start..end])?;
+        if let Some((offset, length)) = output.range(n, graph.size(), graph.forward()) {
+            output.capture(offset, &data[offset..offset + length])?;
+        }
     }
 
     drop(parent_table);
@@ -264,6 +375,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn encode_multicore<H, G>(
     graph: &ZigZagGraph<H, G>,
     use_parent_table: bool,
@@ -285,6 +397,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn encode_multicore_with_config<H, G, F, S>(
     graph: &ZigZagGraph<H, G>,
     use_parent_table: bool,
@@ -293,6 +406,34 @@ fn encode_multicore_with_config<H, G, F, S>(
     config: EncodePipelineConfig,
     before_fill: F,
     before_spawn: S,
+) -> Result<()>
+where
+    H: Hasher,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+    F: Fn(usize, usize) -> Result<()> + Sync,
+    S: Fn(usize) -> std::io::Result<()>,
+{
+    encode_multicore_with_config_and_output(
+        graph,
+        use_parent_table,
+        replica_id,
+        data,
+        config,
+        before_fill,
+        before_spawn,
+        &mut EncodeOutput::default(),
+    )
+}
+
+fn encode_multicore_with_config_and_output<H, G, F, S>(
+    graph: &ZigZagGraph<H, G>,
+    use_parent_table: bool,
+    replica_id: &H::Domain,
+    data: &mut [u8],
+    config: EncodePipelineConfig,
+    before_fill: F,
+    before_spawn: S,
+    output: &mut EncodeOutput<'_>,
 ) -> Result<()>
 where
     H: Hasher,
@@ -411,6 +552,7 @@ where
                     &produced_count,
                     &consumer_position,
                     &cancelled,
+                    output,
                 )
             }))
             .map_err(|payload| {
@@ -716,13 +858,18 @@ fn encode_prefetch_consumer<H, G>(
     produced_count: &AtomicUsize,
     consumer_position: &AtomicUsize,
     cancelled: &AtomicBool,
+    output: &mut EncodeOutput<'_>,
 ) -> Result<()>
 where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     for position in 0..graph.size() {
+        if position & 1023 == 0 {
+            output.check_cancelled()?;
+        }
         while produced_count.load(Ordering::Acquire) <= position {
+            output.check_cancelled()?;
             if cancelled.load(Ordering::Acquire) {
                 return Err(anyhow!("zigzag multicore encode pipeline cancelled"));
             }
@@ -746,6 +893,13 @@ where
             unsafe { data.node_bytes_mut(node) },
         )?;
         consumer_position.store(position + 1, Ordering::Release);
+        if let Some((offset, length)) = output.range(position, graph.size(), graph.forward()) {
+            // SAFETY: only the consumer writes replica bytes. This range is fully
+            // encoded and remains immutable until all feeders have joined; the
+            // callback borrows it synchronously and only queues an owned copy.
+            let bytes = unsafe { std::slice::from_raw_parts(data.ptr.add(offset), length) };
+            output.capture(offset, bytes)?;
+        }
     }
 
     Ok(())
@@ -989,6 +1143,116 @@ mod tests {
     #[test]
     fn encode_decode_reversed() {
         encode_decode_roundtrip(true);
+    }
+
+    #[test]
+    fn encoded_sink_gets_final_bytes_in_both_directions_and_can_cancel() -> Result<()> {
+        struct Sink {
+            bytes: Vec<u8>,
+            ranges: Vec<(usize, usize)>,
+        }
+        impl EncodedSink for Sink {
+            fn capture(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+                self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+                self.ranges.push((offset, bytes.len()));
+                Ok(())
+            }
+        }
+        let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+            None,
+            128,
+            BASE_DEGREE,
+            EXP_DEGREE,
+            [54; 32],
+            ApiVersion::V1_2_0,
+        )?;
+        let replica_id = PoseidonDomain::default();
+        for graph in [graph.clone(), graph.zigzag()] {
+            let mut expected = vec![0u8; 128 * NODE_SIZE];
+            encode_sequential(&graph, None, &replica_id, &mut expected)?;
+            for multicore in [true, false] {
+                let mut data = vec![0u8; expected.len()];
+                let mut sink = Sink {
+                    bytes: vec![0; data.len()],
+                    ranges: Vec::new(),
+                };
+                let cancelled = AtomicBool::new(false);
+                let mut output = EncodeOutput::new(&cancelled, Some(&mut sink), 3)?;
+                if multicore {
+                    encode_multicore_with_config_and_output(
+                        &graph,
+                        false,
+                        &replica_id,
+                        &mut data,
+                        EncodePipelineConfig {
+                            lookahead: 8,
+                            producers: 2,
+                            stride: 3,
+                            affinity: false,
+                            cache_policy: CachePolicy::default(),
+                        },
+                        |_, _| Ok(()),
+                        |_| Ok(()),
+                        &mut output,
+                    )?;
+                } else {
+                    encode_sequential_with_output(
+                        &graph,
+                        None,
+                        &replica_id,
+                        &mut data,
+                        &mut output,
+                    )?;
+                }
+                assert_eq!(data, expected);
+                assert_eq!(sink.bytes, expected);
+                assert_eq!(sink.ranges.len(), 43);
+                assert_eq!(sink.ranges.last().unwrap().1, 2 * NODE_SIZE);
+                for pair in sink.ranges.windows(2) {
+                    assert_eq!(pair[0].0 < pair[1].0, graph.forward());
+                }
+            }
+            struct CancelSink<'a>(&'a AtomicBool);
+            impl EncodedSink for CancelSink<'_> {
+                fn capture(&mut self, _: usize, _: &[u8]) -> Result<()> {
+                    self.0.store(true, Ordering::Release);
+                    Ok(())
+                }
+            }
+            let cancelled = AtomicBool::new(false);
+            let mut sink = CancelSink(&cancelled);
+            let mut partial = vec![0; expected.len()];
+            let mut output = EncodeOutput::new(&cancelled, Some(&mut sink), 3)?;
+            assert!(encode_multicore_with_config_and_output(
+                &graph,
+                false,
+                &replica_id,
+                &mut partial,
+                EncodePipelineConfig {
+                    lookahead: 8,
+                    producers: 2,
+                    stride: 3,
+                    affinity: false,
+                    cache_policy: CachePolicy::default()
+                },
+                |_, _| Ok(()),
+                |_| Ok(()),
+                &mut output
+            )
+            .is_err());
+            assert!(cancelled.load(Ordering::Acquire));
+            let cancelled = AtomicBool::new(true);
+            let mut data = vec![0; expected.len()];
+            assert!(encode_with_output(
+                &graph,
+                &replica_id,
+                &mut data,
+                &mut EncodeOutput::new(&cancelled, None, 3)?
+            )
+            .is_err());
+            assert!(data.iter().all(|byte| *byte == 0));
+        }
+        Ok(())
     }
 
     #[test]

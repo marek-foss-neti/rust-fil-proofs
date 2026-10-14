@@ -4,7 +4,7 @@ mod graph;
 mod params;
 mod parent_table;
 mod proof;
-mod vde;
+pub(super) mod vde;
 
 pub use challenges::{derive_challenges, LayerChallenges};
 pub use graph::{ZigZagBucketGraph, ZigZagGraph, EXP_DEGREE};

@@ -16,6 +16,7 @@ use storage_proofs_core::{
 };
 
 use crate::zigzag::cache_policy::{discard_file, CachePolicy};
+use crate::zigzag::layer_pipeline::{self, LayerPipelineConfig, LayerPipelineMode};
 use crate::zigzag::measurements::OperationGuard;
 use crate::zigzag::merkle_builder::{build_tree_r, TreeRBuilder};
 use crate::{
@@ -167,6 +168,28 @@ where
         data: &mut [u8],
         cache_path: Option<&Path>,
     ) -> Result<(Tau<<Tree::Hasher as Hasher>::Domain, G::Domain>, Vec<Tree>)> {
+        Self::replicate_layers_with_options(
+            graph,
+            layer_challenges,
+            replica_id,
+            comm_d,
+            data,
+            cache_path,
+            TreeRBuilder::from_env()?,
+            LayerPipelineConfig::from_env()?,
+        )
+    }
+
+    fn replicate_layers_with_options(
+        graph: &ZigZagBucketGraph<Tree::Hasher>,
+        layer_challenges: &LayerChallenges,
+        replica_id: &<Tree::Hasher as Hasher>::Domain,
+        comm_d: G::Domain,
+        data: &mut [u8],
+        cache_path: Option<&Path>,
+        tree_r_builder: TreeRBuilder,
+        pipeline: LayerPipelineConfig,
+    ) -> Result<(Tau<<Tree::Hasher as Hasher>::Domain, G::Domain>, Vec<Tree>)> {
         let layers = layer_challenges.layers();
         ensure!(layers > 0, "ZigZag requires at least one layer");
         ensure!(
@@ -174,12 +197,33 @@ where
             "ZigZag data size mismatch"
         );
         let leaves = graph.size();
+        pipeline.validate::<Tree>(tree_r_builder, cache_path)?;
+        if pipeline.mode != LayerPipelineMode::Sequential {
+            let trees = layer_pipeline::replicate::<Tree>(
+                graph,
+                layers,
+                replica_id,
+                data,
+                cache_path.expect("validated pipeline cache"),
+                CachePolicy::from_env()?,
+                pipeline,
+            )?;
+            let layer_comm_rs: Vec<_> = trees.iter().map(MerkleTreeTrait::root).collect();
+            let comm_r_star = comm_r_star::<Tree::Hasher>(replica_id, &layer_comm_rs)?;
+            return Ok((
+                Tau {
+                    comm_d,
+                    layer_comm_rs,
+                    comm_r_star,
+                },
+                trees,
+            ));
+        }
 
         let mut replica_trees: Vec<Tree> = Vec::with_capacity(layers);
         let mut layer_comm_rs = Vec::with_capacity(layers);
         let mut current_graph = graph.clone();
         let cache_policy = CachePolicy::from_env()?;
-        let tree_r_builder = TreeRBuilder::from_env()?;
 
         for layer in 0..layers {
             let operation = OperationGuard::enter("encode", Some(layer));
@@ -191,13 +235,8 @@ where
             let started = Instant::now();
             let tree_r_config =
                 cache_path.map(|p| StoreConfig::new(p, format!("zigzag-tree-r-{layer}"), 0));
-            let tree_r = build_tree_r::<Tree>(
-                tree_r_builder,
-                tree_r_config.clone(),
-                leaves,
-                data,
-                layer,
-            )?;
+            let tree_r =
+                build_tree_r::<Tree>(tree_r_builder, tree_r_config.clone(), leaves, data, layer)?;
             if cache_policy.tree_r_dontneed {
                 if let Some(config) = tree_r_config {
                     let path = StoreConfig::data_path(&config.path, &config.id);
@@ -581,6 +620,102 @@ mod tests {
 
     type ZZTree = MerkleTreeWrapper<PoseidonHasher, DiskStore<PoseidonDomain>, U2, U0, U0>;
     type Piece = Sha256Hasher;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pipelined_layers_match_every_reference_store_and_vanilla_proof() -> Result<()> {
+        for reversed in [false, true] {
+            for layers in [3, 4] {
+                let sp = SetupParams {
+                    nodes: 4096,
+                    degree: BASE_DEGREE,
+                    expansion_degree: EXP_DEGREE,
+                    porep_id: [53; 32],
+                    api_version: ApiVersion::V1_2_0,
+                    layer_challenges: LayerChallenges::new_fixed(layers, 1),
+                };
+                let mut pp = setup::<ZZTree>(&sp)?;
+                if reversed {
+                    pp.graph = pp.graph.zigzag();
+                }
+                let replica_id = PoseidonDomain::default();
+                let mut original = vec![0u8; sp.nodes * NODE_SIZE];
+                for (i, node) in original.chunks_exact_mut(NODE_SIZE).enumerate() {
+                    node[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                }
+                let tree_d =
+                    create_base_merkle_tree::<BinaryMerkleTree<Piece>>(None, sp.nodes, &original)?;
+                let comm_d = tree_d.root();
+                let reference_dir = tempfile::tempdir()?;
+                let mut reference = original.clone();
+                let (reference_tau, _) =
+                    ZigZagDrgPoRep::<ZZTree, Piece>::replicate_layers_with_options(
+                        &pp.graph,
+                        &pp.layer_challenges,
+                        &replica_id,
+                        comm_d,
+                        &mut reference,
+                        Some(reference_dir.path()),
+                        TreeRBuilder::Legacy,
+                        LayerPipelineConfig {
+                            mode: LayerPipelineMode::Sequential,
+                            tree_threads: None,
+                            snapshot_buffer_mib: 1,
+                        },
+                    )?;
+                for mode in [LayerPipelineMode::Overlap, LayerPipelineMode::Stream] {
+                    let directory = tempfile::tempdir()?;
+                    let mut actual = original.clone();
+                    let (tau, trees) =
+                        ZigZagDrgPoRep::<ZZTree, Piece>::replicate_layers_with_options(
+                            &pp.graph,
+                            &pp.layer_challenges,
+                            &replica_id,
+                            comm_d,
+                            &mut actual,
+                            Some(directory.path()),
+                            TreeRBuilder::Binary,
+                            LayerPipelineConfig {
+                                mode,
+                                tree_threads: Some(2),
+                                snapshot_buffer_mib: 1,
+                            },
+                        )?;
+                    assert_eq!(reference, actual);
+                    assert_eq!(reference_tau.layer_comm_rs, tau.layer_comm_rs);
+                    assert_eq!(reference_tau.comm_r_star, tau.comm_r_star);
+                    for layer in 0..layers {
+                        let name = format!("zigzag-tree-r-{layer}");
+                        assert_eq!(
+                            std::fs::read(StoreConfig::data_path(reference_dir.path(), &name))?,
+                            std::fs::read(StoreConfig::data_path(directory.path(), &name))?
+                        );
+                    }
+                    assert_eq!(std::fs::read_dir(directory.path())?.count(), layers);
+                    let inputs = PublicInputs {
+                        replica_id,
+                        seed: None,
+                        tau: Some(tau.simplify()),
+                        comm_r_star: tau.comm_r_star,
+                        k: None,
+                    };
+                    let private = PrivateInputs::<ZZTree, Piece> {
+                        tree_d: create_base_merkle_tree::<BinaryMerkleTree<Piece>>(
+                            None, sp.nodes, &original,
+                        )?,
+                        aux: trees,
+                        layer_comm_rs: tau.layer_comm_rs,
+                        comm_d,
+                    };
+                    let proof = ZigZagDrgPoRep::<ZZTree, Piece>::prove(&pp, &inputs, &private)?;
+                    assert!(ZigZagDrgPoRep::<ZZTree, Piece>::verify(
+                        &pp, &inputs, &proof
+                    )?);
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn decode_buffers_orientations_parity_and_workers() {

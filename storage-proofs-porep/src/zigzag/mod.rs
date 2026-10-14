@@ -11,6 +11,7 @@ pub mod cache_policy;
 pub mod circuit;
 pub(crate) mod groth16_setup;
 pub(crate) mod groth16_setup_disk;
+pub mod layer_pipeline;
 pub mod measurements;
 pub mod merkle_builder;
 pub mod parameters;
