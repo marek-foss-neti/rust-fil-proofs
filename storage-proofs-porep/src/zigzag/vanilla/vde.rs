@@ -20,6 +20,7 @@ use storage_proofs_core::{
 
 use crate::encode;
 use crate::zigzag::cache_policy::{discard_file, CachePolicy};
+use crate::zigzag::encode_prehash::{EncodePrehash, PreparedHash, SHA_BLOCK_BYTES};
 use crate::zigzag::vanilla::cores::EncodeAffinity;
 use crate::zigzag::vanilla::graph::ZigZagGraph;
 use crate::zigzag::vanilla::parent_table::ZigZagParentTable;
@@ -77,6 +78,7 @@ struct EncodePrefetchSlot {
     key_input: Vec<u8>,
     input_len: usize,
     missing_parents: ParentMask,
+    prepared_hash: Option<PreparedHash>,
 }
 
 impl EncodePrefetchSlot {
@@ -86,6 +88,7 @@ impl EncodePrefetchSlot {
             key_input: vec![0u8; key_input_len(degree)],
             input_len: NODE_SIZE,
             missing_parents: ParentMask::default(),
+            prepared_hash: None,
         }
     }
 }
@@ -102,6 +105,7 @@ struct EncodePipelineConfig {
     stride: usize,
     affinity: bool,
     cache_policy: CachePolicy,
+    prehash: EncodePrehash,
 }
 
 struct CancelEncodeOnDrop<'a>(&'a AtomicBool);
@@ -121,6 +125,7 @@ impl EncodePipelineConfig {
             producers: SETTINGS.zigzag_multicore_encode_producers.max(1),
             affinity: SETTINGS.zigzag_multicore_encode_affinity,
             cache_policy: CachePolicy::from_env()?,
+            prehash: EncodePrehash::from_env()?,
             stride: SETTINGS
                 .zigzag_multicore_encode_producer_stride
                 .max(1)
@@ -261,8 +266,8 @@ where
 ///
 /// **Performance:** encoding is inherently sequential (each node depends on already-encoded
 /// parents). Multicore SDR-style strategies from Stacked do not apply directly; any future
-/// speedup must exploit graph structure (e.g. independent sub-DAGs) rather than a flat parallel
-/// map. Tree building after each layer can use GPU Poseidon builders when enabled.
+/// speedup must preserve that order. Feeders can prepare stable SHA prefixes while the consumer
+/// finalizes each key; immutable TreeR snapshots can overlap later encoding on CPU.
 pub fn encode<H, G>(
     graph: &ZigZagGraph<H, G>,
     replica_id: &H::Domain,
@@ -441,6 +446,10 @@ where
     F: Fn(usize, usize) -> Result<()> + Sync,
     S: Fn(usize) -> std::io::Result<()>,
 {
+    ensure!(
+        (1..=32).contains(&graph.degree()),
+        "ZigZag encode parent mask supports 1..=32 parents"
+    );
     let lookahead = config.lookahead.max(1).min(graph.size());
     let producers = config.producers.max(1);
     let stride = config.stride.max(1).min(lookahead);
@@ -515,6 +524,7 @@ where
                                     consumer_position,
                                     cancelled,
                                     stride,
+                                    config.prehash,
                                 )
                             }));
 
@@ -565,6 +575,7 @@ where
             cancelled.store(true, Ordering::Release);
 
             let mut producer_error = None;
+            let mut prefix_blocks = [0u64; 17];
             for runner in runners {
                 let result = runner.join().map_err(|payload| {
                     anyhow!(
@@ -572,16 +583,32 @@ where
                         panic_message(payload.as_ref())
                     )
                 })?;
-                if let Err(err) = result {
-                    if producer_error.is_none() {
-                        producer_error = Some(err);
+                match result {
+                    Ok(histogram) => {
+                        for (total, count) in prefix_blocks.iter_mut().zip(histogram) {
+                            *total += count;
+                        }
                     }
+                    Err(err) if producer_error.is_none() => producer_error = Some(err),
+                    Err(_) => {}
                 }
             }
 
             if let Some(err) = producer_error {
                 Err(err)
             } else {
+                if consumer_result.is_ok() {
+                    log::info!(target: "zigzag_cpu", "zigzag_encode_prehash {}", serde_json::json!({
+                        "enabled": config.prehash.enabled,
+                        "reversed": graph.reversed(),
+                        "nodes": graph.size(),
+                        "prefix_blocks_histogram": prefix_blocks,
+                        "feeder_sha_blocks": prefix_blocks.iter().enumerate().map(|(blocks, count)| blocks as u64 * count).sum::<u64>(),
+                        "midstate_slot_bytes": std::mem::size_of::<Option<PreparedHash>>(),
+                        "midstate_ring_bytes": lookahead * std::mem::size_of::<Option<PreparedHash>>(),
+                        "scope": "one completed encode call; histogram index is complete SHA data blocks prepared per node, excluding consumer padding; ring bytes exclude existing parent/input buffers",
+                    }));
+                }
                 consumer_result
             }
         })
@@ -762,31 +789,36 @@ fn encode_prefetch_runner<H, G>(
     consumer_position: &AtomicUsize,
     cancelled: &AtomicBool,
     stride: usize,
-) -> Result<()>
+    prehash: EncodePrehash,
+) -> Result<[u64; 17]>
 where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
+    let mut prefix_blocks = [0u64; 17];
     loop {
         if cancelled.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(prefix_blocks);
         }
 
         let work = next_work.fetch_add(stride, Ordering::AcqRel);
         if work >= graph.size() {
-            return Ok(());
+            return Ok(prefix_blocks);
         }
         let count = stride.min(graph.size() - work);
 
         for position in work..work + count {
             while position >= consumer_position.load(Ordering::Acquire) + ring.lookahead {
                 if cancelled.load(Ordering::Acquire) {
-                    return Ok(());
+                    return Ok(prefix_blocks);
                 }
                 thread::yield_now();
             }
 
             before_fill(producer, position)?;
+            // SAFETY: this producer owns the slot until publication, and Acquire
+            // above prevents reuse before the previous consumer has released it.
+            let slot = unsafe { ring.slot_mut(position) };
             fill_encode_prefetch_slot(
                 graph,
                 &mut parent_table,
@@ -794,15 +826,19 @@ where
                 data,
                 position,
                 consumer_position.load(Ordering::Acquire),
-                // Safety: the ring protocol ensures a slot is written by at most one producer before
-                // the consumer reads it, and is not reused until `consumer_position` advances.
-                unsafe { ring.slot_mut(position) },
+                slot,
+                prehash,
             )?;
+            let blocks = slot
+                .prepared_hash
+                .as_ref()
+                .map_or(0, |hash| hash.processed_bytes / SHA_BLOCK_BYTES);
+            prefix_blocks[blocks] += 1;
         }
 
         while produced_count.load(Ordering::Acquire) != work {
             if cancelled.load(Ordering::Acquire) {
-                return Ok(());
+                return Ok(prefix_blocks);
             }
             thread::yield_now();
         }
@@ -818,6 +854,7 @@ fn fill_encode_prefetch_slot<H, G>(
     position: usize,
     encoded_frontier: usize,
     slot: &mut EncodePrefetchSlot,
+    prehash: EncodePrehash,
 ) -> Result<()>
 where
     H: Hasher,
@@ -827,6 +864,7 @@ where
     fill_parents(graph, parent_table, node, &mut slot.parents)?;
 
     slot.missing_parents.clear();
+    slot.prepared_hash = None;
     slot.key_input[..NODE_SIZE].copy_from_slice(AsRef::<[u8]>::as_ref(replica_id));
     slot.input_len = NODE_SIZE;
 
@@ -848,7 +886,19 @@ where
         slot.input_len = key_input_len(slot.parents.len());
     }
 
+    prepare_prefetched_hash(slot, prehash);
     Ok(())
+}
+
+fn prepare_prefetched_hash(slot: &mut EncodePrefetchSlot, prehash: EncodePrehash) {
+    slot.prepared_hash = None;
+    if prehash.enabled {
+        let first_missing = (0..slot.parents.len()).find(|&index| slot.missing_parents.get(index));
+        let stable_prefix_bytes =
+            first_missing.map_or(slot.input_len, |index| NODE_SIZE * (index + 1));
+        slot.prepared_hash =
+            PreparedHash::new(&slot.key_input[..slot.input_len], stable_prefix_bytes);
+    }
 }
 
 fn encode_prefetch_consumer<H, G>(
@@ -882,7 +932,7 @@ where
         let slot = unsafe { ring.slot_mut(position) };
         patch_missing_parents(data, slot);
 
-        let key = create_key_from_staged_input::<H>(&slot.key_input[..slot.input_len]);
+        let key = finish_prefetched_key::<H>(slot);
         let node_data = domain_from_node_bytes_unchecked::<H>(
             // Safety: this node is the current traversal frontier and has not been encoded yet.
             unsafe { data.node_bytes(node) },
@@ -903,6 +953,14 @@ where
     }
 
     Ok(())
+}
+
+fn finish_prefetched_key<H: Hasher>(slot: &mut EncodePrefetchSlot) -> H::Domain {
+    let input = &slot.key_input[..slot.input_len];
+    match slot.prepared_hash.take() {
+        Some(prepared) => bytes_into_fr_repr_safe(&prepared.finish(input)).into(),
+        None => create_key_from_staged_input::<H>(input),
+    }
 }
 
 fn patch_missing_parents(data: &EncodeData, slot: &mut EncodePrefetchSlot) {
@@ -1189,6 +1247,7 @@ mod tests {
                             producers: 2,
                             stride: 3,
                             affinity: false,
+                            prehash: EncodePrehash { enabled: true },
                             cache_policy: CachePolicy::default(),
                         },
                         |_, _| Ok(()),
@@ -1233,6 +1292,7 @@ mod tests {
                     producers: 2,
                     stride: 3,
                     affinity: false,
+                    prehash: EncodePrehash { enabled: true },
                     cache_policy: CachePolicy::default()
                 },
                 |_, _| Ok(()),
@@ -1326,6 +1386,7 @@ mod tests {
                             producers,
                             stride: 3,
                             affinity: false,
+                            prehash: EncodePrehash { enabled: true },
                             cache_policy: CachePolicy {
                                 parent_buffer_nodes,
                                 parent_cache_dontneed: true,
@@ -1384,6 +1445,7 @@ mod tests {
                             producers,
                             stride: 2,
                             affinity,
+                            prehash: EncodePrehash { enabled: true },
                             cache_policy: CachePolicy::default(),
                         },
                         |_, _| Ok(()),
@@ -1433,6 +1495,7 @@ mod tests {
                 &replica_id,
                 &mut data,
                 EncodePipelineConfig {
+                    prehash: EncodePrehash { enabled: true },
                     cache_policy: CachePolicy::default(),
                     lookahead: 4,
                     producers: 3,
@@ -1692,3 +1755,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "vde/prehash_tests.rs"]
+mod prehash_tests;
