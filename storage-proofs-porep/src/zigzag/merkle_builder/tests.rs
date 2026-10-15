@@ -83,8 +83,15 @@ fn snapshot_is_independent_and_buffers_are_bounded_with_partial_chunks() {
     let cancelled = AtomicBool::new(false);
     let snapshot = LeafSnapshot::capture(config, leaves, &input, 0, &cancelled).unwrap();
     input.fill(0); // Models the next layer overwriting the replica after capture.
-    let (root, stats) =
-        build_levels(snapshot.file.as_file(), snapshot.geometry, 3, 4, &cancelled).unwrap();
+    let (root, stats) = build_levels_with_dirty_budget(
+        snapshot.file.as_file(),
+        snapshot.geometry,
+        3,
+        4,
+        &cancelled,
+        Some(192),
+    )
+    .unwrap();
     let expected_root: [u8; 32] = expected.root().into();
     assert_eq!(root, expected_root);
     assert_eq!(stats.pairs, (leaves - 1) as u64);
@@ -93,6 +100,9 @@ fn snapshot_is_independent_and_buffers_are_bounded_with_partial_chunks() {
     assert!(stats.workers <= 4);
     assert!(stats.buffer_bytes <= 4 * 3 * 160);
     assert_eq!(stats.buffer_allocations, stats.workers * 3);
+    let dirty = stats.dirty_budget.unwrap();
+    assert_eq!(dirty.flushed_bytes, stats.written_bytes);
+    assert!(dirty.peak_outstanding_bytes <= 192);
 }
 
 #[test]
@@ -242,62 +252,6 @@ fn writeback_errors_are_returned_after_workers_join() {
     let error = build_levels(&io, geometry, 3, 4, &io.cancelled).unwrap_err();
     assert_eq!(
         error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
-        Some(libc::EIO)
-    );
-}
-
-#[test]
-fn dirty_budget_bounds_concurrent_writes_and_propagates_flush_failure() {
-    struct CountIo {
-        dirty: AtomicUsize,
-        peak: AtomicUsize,
-        flushes: AtomicUsize,
-        fail: bool,
-    }
-    impl PositionedIo for CountIo {
-        fn read_at(&self, _: &mut [u8], _: u64) -> io::Result<usize> {
-            unreachable!()
-        }
-        fn start_writeback(&self, _: u64, _: u64) -> io::Result<()> {
-            Ok(())
-        }
-        fn write_at(&self, bytes: &[u8], _: u64) -> io::Result<usize> {
-            let dirty = self.dirty.fetch_add(bytes.len(), Ordering::SeqCst) + bytes.len();
-            self.peak.fetch_max(dirty, Ordering::SeqCst);
-            Ok(bytes.len())
-        }
-        fn sync_data(&self) -> io::Result<()> {
-            if self.fail {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
-            }
-            self.flushes.fetch_add(1, Ordering::SeqCst);
-            self.dirty.store(0, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-    let mut io = CountIo {
-        dirty: AtomicUsize::new(0),
-        peak: AtomicUsize::new(0),
-        flushes: AtomicUsize::new(0),
-        fail: false,
-    };
-    let budget = DirtyBudget::new(96).unwrap();
-    (0..32)
-        .into_par_iter()
-        .for_each(|i| budget.write(&io, &[0; 32], i * 32).unwrap());
-    assert!(io.peak.load(Ordering::SeqCst) <= 96);
-    assert_eq!(io.flushes.load(Ordering::SeqCst), 10);
-    assert!(budget.write(&io, &[0; 128], 0).is_err());
-    io.fail = true;
-    let budget = DirtyBudget::new(32).unwrap();
-    budget.write(&io, &[0; 32], 0).unwrap();
-    assert_eq!(
-        budget
-            .write(&io, &[0; 32], 32)
-            .unwrap_err()
-            .downcast_ref::<io::Error>()
-            .unwrap()
-            .raw_os_error(),
         Some(libc::EIO)
     );
 }

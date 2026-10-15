@@ -17,8 +17,9 @@ use serde::Serialize;
 use storage_proofs_core::{drgraph::Graph, merkle::MerkleTreeTrait, settings::SETTINGS};
 
 use super::cache_policy::{discard_file, CachePolicy};
-use super::measurements::OperationGuard;
-use super::merkle_builder::{supports_binary, DirtyBudget, LeafSnapshot, TreeRBuilder};
+use super::dirty_writeback::with_dirty_budget;
+use super::measurements::{OperationGuard, WaitStats};
+use super::merkle_builder::{supports_binary, LeafSnapshot, TreeRBuilder};
 use super::vanilla::{vde, ZigZagBucketGraph};
 
 const CHUNK_BYTES: usize = 1 << 20;
@@ -263,18 +264,24 @@ pub(crate) fn replicate<Tree: 'static + MerkleTreeTrait>(
                 trees.push(tree.join()?);
             }
             let tree_operation = OperationGuard::enter("tree_r", Some(layer));
-            let dirty = DirtyBudget::new(DIRTY_BYTES)?;
             let snapshot = LeafSnapshot::capture_with(
                 store.clone(),
                 graph.size(),
                 layer,
                 &cancelled,
                 |file, expected| {
-                    for (index, bytes) in data.chunks(CHUNK_BYTES).enumerate() {
-                        ensure!(!cancelled.load(Ordering::Acquire), "snapshot cancelled");
-                        dirty.write(file, bytes, (index * CHUNK_BYTES) as u64)?;
-                    }
-                    file.sync_data()?;
+                    let (_, stats) = with_dirty_budget(file, DIRTY_BYTES, &cancelled, |dirty| {
+                        for (index, bytes) in data.chunks(CHUNK_BYTES).enumerate() {
+                            ensure!(!cancelled.load(Ordering::Acquire), "snapshot cancelled");
+                            dirty.write(file, bytes, (index * CHUNK_BYTES) as u64)?;
+                        }
+                        Ok(())
+                    })?;
+                    log::info!(target: "zigzag_pipeline", "zigzag_pipeline {}", serde_json::json!({
+                        "layer": layer, "mode": "overlap", "state": "written",
+                        "written_bytes": expected, "dirty_budget": stats,
+                        "scope": "snapshot writes and flushes completed; final store publication still pending"
+                    }));
                     Ok(expected)
                 },
             )?;
@@ -336,6 +343,7 @@ struct SnapshotWriter {
     cancelled: Arc<AtomicBool>,
     captured: usize,
     expected: usize,
+    buffer_wait: WaitStats,
 }
 
 impl SnapshotWriter {
@@ -392,27 +400,52 @@ impl SnapshotWriter {
                 let mut aborted = false;
                 let snapshot = LeafSnapshot::capture_with(config, leaves, layer, &cancel, |file, expected| {
                     ready_sender.send(())?;
-                    let dirty = DirtyBudget::new(DIRTY_BYTES)?;
                     let mut written = 0usize;
                     let mut chunks = 0usize;
-                    for chunk in receiver {
+                    let mut input_wait = WaitStats::default();
+                    let mut write_ns = 0u64;
+                    let (_, dirty_stats) = with_dirty_budget(file, DIRTY_BYTES, &cancel, |dirty| {
+                    loop {
+                        let chunk = match receiver.try_recv() {
+                            Ok(chunk) => chunk,
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                let started = Instant::now();
+                                let received = loop {
+                                    ensure!(!cancel.load(Ordering::Acquire), "snapshot cancelled");
+                                    match receiver.recv_timeout(Duration::from_millis(50)) {
+                                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                                        result => break result,
+                                    }
+                                };
+                                input_wait.record(started);
+                                match received {
+                                    Ok(chunk) => chunk,
+                                    Err(_) => break,
+                                }
+                            }
+                        };
                         if cancel.load(Ordering::Acquire) { aborted = true; return Ok(written); }
                         let length = chunk_bytes.min(expected - written);
                         let offset = if forward { written } else { expected - written - length };
                         ensure!(chunk.layer == layer && chunk.length == length && chunk.offset == offset
                             && chunk.bytes.len() >= length && length > 0, "out-of-order or invalid snapshot chunk");
                         before_write(chunks, offset)?;
+                        let started = Instant::now();
                         dirty.write(file, &chunk.bytes[..length], offset as u64)?;
+                        write_ns += started.elapsed().as_nanos() as u64;
                         written += length;
                         chunks += 1;
                         if free_sender.send(chunk.bytes).is_err() { aborted = true; return Ok(written); }
                     }
                     if cancel.load(Ordering::Acquire) { aborted = true; return Ok(written); }
                     ensure!(written == expected, "incomplete streamed snapshot");
-                    file.sync_data()?;
+                    Ok(written)
+                    })?;
                     log::info!(target: "zigzag_pipeline", "zigzag_pipeline {}", serde_json::json!({
                         "layer": layer, "written_bytes": written, "chunks": chunks,
                         "pool_buffers": buffers, "pool_bytes": buffers * chunk_bytes, "forward": forward,
+                        "writer_input_wait": input_wait, "writer_write_ns": write_ns, "dirty_budget": dirty_stats,
                         "state": "written", "scope": "leaf writes finished; final store durability and publication still pending"
                     }));
                     Ok(written)
@@ -432,6 +465,7 @@ impl SnapshotWriter {
             cancelled,
             captured: 0,
             expected,
+            buffer_wait: WaitStats::default(),
         };
         if ready.recv().is_err() {
             let result = writer.finish(Err(anyhow!("snapshot allocation failed")));
@@ -447,35 +481,53 @@ impl SnapshotWriter {
             self.cancelled.store(true, Ordering::Release);
         }
         self.sender.take();
+        let started = Instant::now();
         let result = self
             .handle
             .take()
             .expect("snapshot writer")
             .join()
             .map_err(|_| anyhow!("snapshot writer panicked"))?;
+        let finish_wait_ns = started.elapsed().as_nanos() as u64;
         let snapshot = result?;
         encode_result?;
         ensure!(
             self.captured == self.expected,
             "incomplete captured snapshot"
         );
-        snapshot.context("snapshot writer cancelled")
+        let snapshot = snapshot.context("snapshot writer cancelled")?;
+        log::info!(target: "zigzag_pipeline", "zigzag_pipeline {}", serde_json::json!({
+            "layer": self.layer, "mode": "stream", "state": "writer_joined",
+            "snapshot_buffer_wait": self.buffer_wait, "writer_finish_wait_ns": finish_wait_ns,
+            "scope": "encoder buffer starvation and final writer join; nested in encode/capture, not additive to PC1"
+        }));
+        Ok(snapshot)
     }
 }
 
 impl vde::EncodedSink for SnapshotWriter {
     fn capture(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let mut waiting = None;
         let mut buffer = loop {
             ensure!(
                 !self.cancelled.load(Ordering::Acquire),
                 "snapshot writer cancelled"
             );
+            match self.available.try_recv() {
+                Ok(buffer) => break buffer,
+                Err(mpsc::TryRecvError::Disconnected) => bail!("snapshot buffer pool closed"),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            waiting.get_or_insert_with(Instant::now);
             match self.available.recv_timeout(Duration::from_millis(50)) {
                 Ok(buffer) => break buffer,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(error) => return Err(error.into()),
             }
         };
+        if let Some(started) = waiting {
+            self.buffer_wait.record(started);
+        }
         ensure!(bytes.len() <= buffer.len(), "encoded chunk exceeds buffer");
         buffer[..bytes.len()].copy_from_slice(bytes);
         self.sender

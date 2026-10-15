@@ -2,6 +2,7 @@ use std::cell::UnsafeCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, ensure, Context};
 use blstrs::Scalar as Fr;
@@ -21,11 +22,20 @@ use storage_proofs_core::{
 use crate::encode;
 use crate::zigzag::cache_policy::{discard_file, CachePolicy};
 use crate::zigzag::encode_prehash::{EncodePrehash, PreparedHash, SHA_BLOCK_BYTES};
+use crate::zigzag::measurements::WaitStats;
 use crate::zigzag::vanilla::cores::EncodeAffinity;
 use crate::zigzag::vanilla::graph::ZigZagGraph;
 use crate::zigzag::vanilla::parent_table::ZigZagParentTable;
 
 const DECODE_CHUNK_NODES: usize = 16 * 1024;
+
+#[derive(Default, serde::Serialize)]
+struct FeederStats {
+    producer: usize,
+    prefix_blocks: [u64; 17],
+    ring_full_wait: WaitStats,
+    publication_wait: WaitStats,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ParentMask(u32);
@@ -576,6 +586,7 @@ where
 
             let mut producer_error = None;
             let mut prefix_blocks = [0u64; 17];
+            let mut feeder_waits = Vec::with_capacity(producers);
             for runner in runners {
                 let result = runner.join().map_err(|payload| {
                     anyhow!(
@@ -584,10 +595,11 @@ where
                     )
                 })?;
                 match result {
-                    Ok(histogram) => {
-                        for (total, count) in prefix_blocks.iter_mut().zip(histogram) {
+                    Ok(stats) => {
+                        for (total, count) in prefix_blocks.iter_mut().zip(stats.prefix_blocks) {
                             *total += count;
                         }
+                        feeder_waits.push(stats);
                     }
                     Err(err) if producer_error.is_none() => producer_error = Some(err),
                     Err(_) => {}
@@ -606,10 +618,13 @@ where
                         "feeder_sha_blocks": prefix_blocks.iter().enumerate().map(|(blocks, count)| blocks as u64 * count).sum::<u64>(),
                         "midstate_slot_bytes": std::mem::size_of::<Option<PreparedHash>>(),
                         "midstate_ring_bytes": lookahead * std::mem::size_of::<Option<PreparedHash>>(),
+                        "consumer_ready_wait": consumer_result.as_ref().ok(),
+                        "feeders": feeder_waits,
+                        "wait_scope": "wall-time wait episodes, clocks only on contended paths; feeder ring-full/publication waits overlap consumer and snapshot waits; not additive to encode or PC1",
                         "scope": "one completed encode call; histogram index is complete SHA data blocks prepared per node, excluding consumer padding; ring bytes exclude existing parent/input buffers",
                     }));
                 }
-                consumer_result
+                consumer_result.map(|_| ())
             }
         })
     }))
@@ -790,29 +805,38 @@ fn encode_prefetch_runner<H, G>(
     cancelled: &AtomicBool,
     stride: usize,
     prehash: EncodePrehash,
-) -> Result<[u64; 17]>
+) -> Result<FeederStats>
 where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
-    let mut prefix_blocks = [0u64; 17];
+    let mut stats = FeederStats {
+        producer,
+        ..Default::default()
+    };
     loop {
         if cancelled.load(Ordering::Acquire) {
-            return Ok(prefix_blocks);
+            return Ok(stats);
         }
 
         let work = next_work.fetch_add(stride, Ordering::AcqRel);
         if work >= graph.size() {
-            return Ok(prefix_blocks);
+            return Ok(stats);
         }
         let count = stride.min(graph.size() - work);
 
         for position in work..work + count {
+            let mut waiting = None;
             while position >= consumer_position.load(Ordering::Acquire) + ring.lookahead {
+                waiting.get_or_insert_with(Instant::now);
                 if cancelled.load(Ordering::Acquire) {
-                    return Ok(prefix_blocks);
+                    stats.ring_full_wait.record(waiting.unwrap());
+                    return Ok(stats);
                 }
                 thread::yield_now();
+            }
+            if let Some(started) = waiting {
+                stats.ring_full_wait.record(started);
             }
 
             before_fill(producer, position)?;
@@ -833,14 +857,20 @@ where
                 .prepared_hash
                 .as_ref()
                 .map_or(0, |hash| hash.processed_bytes / SHA_BLOCK_BYTES);
-            prefix_blocks[blocks] += 1;
+            stats.prefix_blocks[blocks] += 1;
         }
 
+        let mut waiting = None;
         while produced_count.load(Ordering::Acquire) != work {
+            waiting.get_or_insert_with(Instant::now);
             if cancelled.load(Ordering::Acquire) {
-                return Ok(prefix_blocks);
+                stats.publication_wait.record(waiting.unwrap());
+                return Ok(stats);
             }
             thread::yield_now();
+        }
+        if let Some(started) = waiting {
+            stats.publication_wait.record(started);
         }
         produced_count.fetch_add(count, Ordering::AcqRel);
     }
@@ -909,21 +939,27 @@ fn encode_prefetch_consumer<H, G>(
     consumer_position: &AtomicUsize,
     cancelled: &AtomicBool,
     output: &mut EncodeOutput<'_>,
-) -> Result<()>
+) -> Result<WaitStats>
 where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
+    let mut ready_wait = WaitStats::default();
     for position in 0..graph.size() {
         if position & 1023 == 0 {
             output.check_cancelled()?;
         }
+        let mut waiting = None;
         while produced_count.load(Ordering::Acquire) <= position {
+            waiting.get_or_insert_with(Instant::now);
             output.check_cancelled()?;
             if cancelled.load(Ordering::Acquire) {
                 return Err(anyhow!("zigzag multicore encode pipeline cancelled"));
             }
             thread::yield_now();
+        }
+        if let Some(started) = waiting {
+            ready_wait.record(started);
         }
 
         let node = traversal_node(graph, position);
@@ -952,7 +988,7 @@ where
         }
     }
 
-    Ok(())
+    Ok(ready_wait)
 }
 
 fn finish_prefetched_key<H: Hasher>(slot: &mut EncodePrefetchSlot) -> H::Domain {
