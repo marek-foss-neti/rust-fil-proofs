@@ -549,6 +549,7 @@ impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, 
         // proving/validation. Parameter loading has its own operation; API-level
         // VK lookup and seal-proof serialization remain outside this interval.
         let c2 = OperationGuard::enter("groth16_c2", None);
+        let _gpu_admission = crate::zigzag::gpu::ProvingGuard::enter()?;
         ensure!(!vanilla_proofs.is_empty(), "missing ZigZag vanilla proofs");
         let batch_size = Self::groth16_batch_size(pub_params)?;
         let proof_count = vanilla_proofs.len();

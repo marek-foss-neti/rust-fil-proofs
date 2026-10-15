@@ -76,6 +76,7 @@ tempfile.workspace = true
 [features]
 default = ["opencl", "multicore-sdr"]
 cuda = [
+    "ec-gpu-gen/cuda",
     "storage-proofs-core/cuda",
     "filecoin-hashers/cuda",
     "neptune/cuda",
@@ -87,6 +88,7 @@ cuda-supraseal = [
     "bellperson/cuda-supraseal",
 ]
 opencl = [
+    "ec-gpu-gen/opencl",
     "storage-proofs-core/opencl",
     "filecoin-hashers/opencl",
     "neptune/opencl",
