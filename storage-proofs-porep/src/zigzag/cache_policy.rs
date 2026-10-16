@@ -5,10 +5,14 @@
 use std::convert::TryFrom;
 use std::env;
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
+use merkletree::store::StoreConfig;
 use serde::Serialize;
+
+use super::measurements::OperationGuard;
 
 pub const MAX_PARENT_BUFFER_NODES: usize = 262_144;
 
@@ -18,8 +22,15 @@ pub struct CachePolicy {
     pub parent_buffer_nodes: usize,
     /// Advice is issued only after all encode readers have joined and unmapped.
     pub parent_cache_dontneed: bool,
-    /// Sync each completed historical TreeR before issuing advice; keep it for C1.
+    /// Release TreeR pages only at C2 entry, after all C1 generation/serialization/validation.
     pub tree_r_dontneed: bool,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct TreeRCacheRelease {
+    pub advised_files: usize,
+    pub advised_bytes: u64,
+    pub skipped_files: usize,
 }
 
 impl CachePolicy {
@@ -39,6 +50,80 @@ impl CachePolicy {
             tree_r_dontneed: boolean("FIL_PROOFS_ZIGZAG_TREE_R_DONTNEED")?,
         })
     }
+
+    /// Optional local residency advice, never a dependency of C2 correctness.
+    /// Call only after vanilla verification and any C1 artifact publication. Roots must
+    /// come from the validated C1, not from the cache hint. The named stores are checked
+    /// against those roots and the expected length before sync/advice. No TreeD, replica,
+    /// parent cache or parameter files are touched; no directory scan or tree rebuild occurs.
+    pub fn release_tree_r_cache(
+        &self,
+        cache_path: Option<&Path>,
+        expected_roots: &[[u8; 32]],
+        expected_file_bytes: u64,
+    ) -> TreeRCacheRelease {
+        let mut stats = TreeRCacheRelease::default();
+        if !self.tree_r_dontneed {
+            return stats;
+        }
+        let operation = OperationGuard::enter("groth16_tree_r_cache_release", None);
+        if let Some(cache_path) = cache_path {
+            for (layer, root) in expected_roots.iter().enumerate() {
+                let path = StoreConfig::data_path(cache_path, &format!("zigzag-tree-r-{layer}"));
+                let result = matching_tree_r(&path, root, expected_file_bytes).and_then(|file| {
+                    // Legacy stores can still have dirty pages in the ordinary Rust API.
+                    // Keep this work at C2 entry, never in PC1 or between C1 operations.
+                    file.sync_data()?;
+                    discard_range(&file, 0, expected_file_bytes)
+                });
+                match result {
+                    Ok(bytes) => {
+                        stats.advised_files += 1;
+                        stats.advised_bytes += bytes;
+                    }
+                    Err(error) => {
+                        stats.skipped_files += 1;
+                        log::warn!(target: "zigzag_cache", "TreeR DONTNEED skipped at C2 layer={layer}: {error}");
+                    }
+                }
+            }
+        } else {
+            stats.skipped_files = expected_roots.len();
+        }
+        log::info!(target: "zigzag_cache", "TreeR DONTNEED at C2 {}", serde_json::json!(stats));
+        operation.finish();
+        stats
+    }
+}
+
+fn matching_tree_r(path: &Path, root: &[u8; 32], expected_file_bytes: u64) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A portable C1 envelope may carry a stale path from another host. Never follow
+        // a final-component symlink or block opening a FIFO/device instead of a store.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || expected_file_bytes < 32 || metadata.len() != expected_file_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TreeR store type/size mismatch",
+        ));
+    }
+    file.seek(SeekFrom::Start(expected_file_bytes - 32))?;
+    let mut stored_root = [0; 32];
+    file.read_exact(&mut stored_root)?;
+    if stored_root != *root {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TreeR root does not match validated C1",
+        ));
+    }
+    Ok(file)
 }
 
 fn boolean(name: &str) -> Result<bool> {
@@ -110,6 +195,85 @@ fn discard_range(_file: &File, _offset: u64, _len: u64) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store(cache: &Path, layer: usize, bytes: usize, root: [u8; 32]) -> io::Result<Vec<u8>> {
+        let mut data = vec![0x5a; bytes];
+        data[bytes - 32..].copy_from_slice(&root);
+        std::fs::write(
+            StoreConfig::data_path(cache, &format!("zigzag-tree-r-{layer}")),
+            &data,
+        )?;
+        Ok(data)
+    }
+
+    #[test]
+    fn tree_r_hint_rejects_wrong_root_size_and_missing_store() -> Result<()> {
+        let cache = tempfile::tempdir()?;
+        store(cache.path(), 0, 16384, [7; 32])?;
+        let path = StoreConfig::data_path(cache.path(), "zigzag-tree-r-0");
+        assert!(matching_tree_r(&path, &[7; 32], 16384).is_ok());
+        assert!(matching_tree_r(&path, &[8; 32], 16384).is_err());
+        assert!(matching_tree_r(&path, &[7; 32], 8192).is_err());
+        assert!(matching_tree_r(&path, &[7; 32], 0).is_err());
+        assert!(matching_tree_r(&cache.path().join("missing"), &[7; 32], 16384).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_r_hint_rejects_symlink_directory_and_fifo_without_blocking() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let cache = tempfile::tempdir()?;
+        store(cache.path(), 0, 16384, [7; 32])?;
+        let path = StoreConfig::data_path(cache.path(), "zigzag-tree-r-0");
+        let link = cache.path().join("link");
+        symlink(&path, &link)?;
+        assert!(matching_tree_r(&link, &[7; 32], 16384).is_err());
+        assert!(matching_tree_r(cache.path(), &[7; 32], 16384).is_err());
+        let fifo = cache.path().join("fifo");
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes())?;
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(matching_tree_r(&fifo, &[7; 32], 16384).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tree_r_release_only_advises_matching_stores_and_preserves_every_file() -> Result<()> {
+        let cache = tempfile::tempdir()?;
+        let first = store(cache.path(), 0, 16384, [7; 32])?;
+        let stale = store(cache.path(), 1, 16384, [8; 32])?;
+        let unrelated = cache.path().join("replica.dat");
+        std::fs::write(&unrelated, b"unrelated replica")?;
+        let policy = CachePolicy {
+            tree_r_dontneed: true,
+            ..Default::default()
+        };
+        let stats = policy.release_tree_r_cache(Some(cache.path()), &[[7; 32]; 3], 16384);
+        assert_eq!(stats.advised_files, 1);
+        assert_eq!(stats.advised_bytes, 16384);
+        assert_eq!(stats.skipped_files, 2);
+        assert_eq!(
+            std::fs::read(StoreConfig::data_path(cache.path(), "zigzag-tree-r-0"))?,
+            first
+        );
+        assert_eq!(
+            std::fs::read(StoreConfig::data_path(cache.path(), "zigzag-tree-r-1"))?,
+            stale
+        );
+        assert_eq!(std::fs::read(&unrelated)?, b"unrelated replica");
+        assert_eq!(
+            policy
+                .release_tree_r_cache(None, &[[7; 32]; 3], 16384)
+                .skipped_files,
+            3
+        );
+        let disabled =
+            CachePolicy::default().release_tree_r_cache(Some(cache.path()), &[[7; 32]; 3], 16384);
+        assert_eq!((disabled.advised_files, disabled.skipped_files), (0, 0));
+        Ok(())
+    }
 
     #[test]
     fn advice_never_extends_beyond_completed_pages_or_uses_zero_length() {

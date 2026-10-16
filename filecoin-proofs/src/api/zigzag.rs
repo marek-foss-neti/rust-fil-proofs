@@ -91,6 +91,7 @@ pub struct ZigZagProverState<Tree: MerkleTreeTrait> {
     tau: Tau<TreeDomain<Tree>, DefaultPieceDomain>,
     tree_d: BinaryMerkleTree<DefaultPieceHasher>,
     trees: Vec<Tree>,
+    cache_path: Option<PathBuf>,
 }
 
 /// Persisted manifest written to the cache directory during phase 1 so sealing can resume.
@@ -237,6 +238,7 @@ fn zigzag_pre_commit_with_replica_id_domain<Tree: 'static + MerkleTreeTrait>(
         tau,
         tree_d,
         trees,
+        cache_path: cache_path.map(Path::to_path_buf),
     };
 
     Ok((out, state))
@@ -440,6 +442,7 @@ pub fn zigzag_prove_from_cache<Tree: 'static + MerkleTreeTrait>(
 where
     TreeDomain<Tree>: From<blstrs::Scalar>,
 {
+    let cache_path = cache_path.as_ref();
     let phase1 = zigzag_commit_phase1_from_cache::<Tree>(
         porep_config,
         cache_path,
@@ -451,7 +454,7 @@ where
         ticket,
         seed,
     )?;
-    zigzag_commit_phase2(porep_config, phase1, prover_id, sector_id)
+    zigzag_commit_phase2_with_cache(porep_config, phase1, prover_id, sector_id, Some(cache_path))
 }
 
 /// Open and validate the persisted Merkle stores, then create and verify only
@@ -566,6 +569,7 @@ where
         tau,
         tree_d,
         trees,
+        cache_path: Some(cache_path.to_path_buf()),
     };
 
     let compound_setup_params = compound_proof::SetupParams {
@@ -782,8 +786,25 @@ pub fn zigzag_commit_phase2<Tree: 'static + MerkleTreeTrait>(
 where
     TreeDomain<Tree>: From<blstrs::Scalar>,
 {
+    zigzag_commit_phase2_with_cache(porep_config, phase1, prover_id, sector_id, None)
+}
+
+/// Create Groth16 proofs with optional local TreeR page-cache release after C1 validation.
+/// The cache is only a locality hint: missing, stale or inaccessible stores are skipped.
+/// Call after C1 has been serialized/persisted. No paths are added to the portable C1 result.
+pub fn zigzag_commit_phase2_with_cache<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
+    phase1: ZigZagCommitPhase1Output<Tree>,
+    prover_id: ProverId,
+    sector_id: SectorId,
+    cache_path: Option<&Path>,
+) -> Result<SealCommitOutput>
+where
+    TreeDomain<Tree>: From<blstrs::Scalar>,
+{
     let (public_inputs, params) =
         validated_zigzag_commit_phase1(porep_config, &phase1, prover_id, sector_id)?;
+    release_tree_r_cache::<Tree>(porep_config, cache_path, &phase1.layer_comm_rs)?;
     let groth_params = get_zigzag_params::<Tree>(porep_config)?;
     let proofs = ZigZagCompound::<Tree, DefaultPieceHasher>::circuit_proofs_with_parameters(
         &public_inputs,
@@ -797,6 +818,21 @@ where
     let mut bytes = Vec::new();
     proof.write(&mut bytes)?;
     Ok(SealCommitOutput { proof: bytes })
+}
+
+fn release_tree_r_cache<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
+    cache_path: Option<&Path>,
+    roots: &[Commitment],
+) -> Result<()> {
+    let policy = storage_proofs_porep::zigzag::cache_policy::CachePolicy::from_env()?;
+    if policy.tree_r_dontneed {
+        let tree_bytes = (get_base_tree_size::<Tree>(porep_config.sector_size)? as u64)
+            .checked_mul(NODE_SIZE as u64)
+            .context("TreeR store size overflow")?;
+        policy.release_tree_r_cache(cache_path, roots, tree_bytes);
+    }
+    Ok(())
 }
 
 /// Produce a Groth16 proof for a previously replicated sector.
@@ -816,6 +852,7 @@ where
         tau,
         tree_d,
         trees,
+        cache_path,
     } = state;
 
     let compound_setup_params = compound_proof::SetupParams {
@@ -842,12 +879,26 @@ where
         comm_d: tau.comm_d,
     };
 
-    let groth_params = get_zigzag_params::<Tree>(porep_config)?;
-    let proofs = ZigZagCompound::<Tree, DefaultPieceHasher>::prove_with_parameters(
+    let vanilla = ZigZagCompound::<Tree, DefaultPieceHasher>::vanilla_proofs(
         &compound_public_params,
         &public_inputs,
         &private_inputs,
+    )?;
+    drop(private_inputs);
+    let roots = tau
+        .layer_comm_rs
+        .iter()
+        .copied()
+        .map(commitment_from_domain)
+        .collect::<Vec<_>>();
+    release_tree_r_cache::<Tree>(porep_config, cache_path.as_deref(), &roots)?;
+    let groth_params = get_zigzag_params::<Tree>(porep_config)?;
+    let proofs = ZigZagCompound::<Tree, DefaultPieceHasher>::circuit_proofs_with_parameters(
+        &public_inputs,
+        vanilla,
+        &compound_public_params.vanilla_params,
         &groth_params,
+        compound_public_params.priority,
     )?;
 
     let verifying_key = get_zigzag_verifying_key::<Tree>(porep_config)?;

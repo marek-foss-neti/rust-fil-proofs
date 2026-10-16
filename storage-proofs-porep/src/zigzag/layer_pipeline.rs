@@ -2,7 +2,6 @@
 //! The active replica is never read by a background worker. Streaming transfers
 //! owned chunks to the leaf section of the final store, including reverse layers.
 
-use std::fs::File;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +15,6 @@ use merkletree::store::StoreConfig;
 use serde::Serialize;
 use storage_proofs_core::{drgraph::Graph, merkle::MerkleTreeTrait, settings::SETTINGS};
 
-use super::cache_policy::{discard_file, CachePolicy};
 use super::dirty_writeback::with_dirty_budget;
 use super::measurements::{OperationGuard, WaitStats};
 use super::merkle_builder::{supports_binary, LeafSnapshot, TreeRBuilder};
@@ -167,7 +165,6 @@ pub(crate) fn replicate<Tree: 'static + MerkleTreeTrait>(
     replica_id: &<Tree::Hasher as Hasher>::Domain,
     data: &mut [u8],
     cache: &Path,
-    policy: CachePolicy,
     config: LayerPipelineConfig,
 ) -> Result<Vec<Tree>> {
     config.validate::<Tree>(TreeRBuilder::Binary, Some(cache))?;
@@ -307,10 +304,6 @@ pub(crate) fn replicate<Tree: 'static + MerkleTreeTrait>(
                             .build_with_dirty_limit(layer, &cancel, Some(DIRTY_BYTES))?
                             .publish::<Tree>(layer, &cancel)
                     })?;
-                    if policy.tree_r_dontneed {
-                        // publish has already synced the completed store.
-                        discard_file(&File::open(StoreConfig::data_path(&store.path, &store.id))?);
-                    }
                     tree_operation.finish();
                     Ok(tree)
                 })
