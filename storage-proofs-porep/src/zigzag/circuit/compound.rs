@@ -472,6 +472,22 @@ impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, 
         priv_in: &<ZigZagDrgPoRep<Tree, G> as ProofScheme<'a>>::PrivateInputs,
         groth_params: &ZigZagParameters,
     ) -> Result<Vec<groth16::Proof<Bls12>>> {
+        let vanilla = Self::vanilla_proofs(pub_params, pub_in, priv_in)?;
+        Self::circuit_proofs_with_parameters(
+            pub_in,
+            vanilla,
+            &pub_params.vanilla_params,
+            groth_params,
+            pub_params.priority,
+        )
+    }
+
+    /// Generate and verify the vanilla witness before loading parameters or releasing tree pages.
+    pub fn vanilla_proofs<'a>(
+        pub_params: &compound_proof::PublicParams<'a, ZigZagDrgPoRep<Tree, G>>,
+        pub_in: &PublicInputs<<Tree::Hasher as Hasher>::Domain, G::Domain>,
+        priv_in: &<ZigZagDrgPoRep<Tree, G> as ProofScheme<'a>>::PrivateInputs,
+    ) -> Result<Vec<<ZigZagDrgPoRep<Tree, G> as ProofScheme<'a>>::Proof>> {
         let partitions = Self::partition_count(pub_params);
         ensure!(partitions > 0, "There must be partitions");
         let vanilla_proving = OperationGuard::enter("vanilla_proving", None);
@@ -492,13 +508,7 @@ impl<Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ZigZagCompound<Tree, 
             "sanity check failed"
         );
         vanilla_verification.finish();
-        Self::circuit_proofs_with_parameters(
-            pub_in,
-            vanilla,
-            &pub_params.vanilla_params,
-            groth_params,
-            pub_params.priority,
-        )
+        Ok(vanilla)
     }
 
     #[cfg(not(feature = "cuda-supraseal"))]

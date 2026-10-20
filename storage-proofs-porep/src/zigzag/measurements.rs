@@ -7,6 +7,22 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::Instant;
+
+/// Thread-local wait episodes, merged only after workers join. Start the clock
+/// only on the contended path, not for every encoded node or polling iteration.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct WaitStats {
+    pub events: u64,
+    pub elapsed_ns: u64,
+}
+
+impl WaitStats {
+    pub(crate) fn record(&mut self, started: Instant) {
+        self.events += 1;
+        self.elapsed_ns += started.elapsed().as_nanos() as u64;
+    }
+}
 
 static OBSERVER: OnceLock<fn(OperationEvent)> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);

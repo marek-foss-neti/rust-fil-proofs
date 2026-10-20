@@ -15,7 +15,6 @@ use storage_proofs_core::{
     util::NODE_SIZE,
 };
 
-use crate::zigzag::cache_policy::{discard_file, CachePolicy};
 use crate::zigzag::layer_pipeline::{self, LayerPipelineConfig, LayerPipelineMode};
 use crate::zigzag::measurements::OperationGuard;
 use crate::zigzag::merkle_builder::{build_tree_r, TreeRBuilder};
@@ -205,7 +204,6 @@ where
                 replica_id,
                 data,
                 cache_path.expect("validated pipeline cache"),
-                CachePolicy::from_env()?,
                 pipeline,
             )?;
             let layer_comm_rs: Vec<_> = trees.iter().map(MerkleTreeTrait::root).collect();
@@ -223,8 +221,6 @@ where
         let mut replica_trees: Vec<Tree> = Vec::with_capacity(layers);
         let mut layer_comm_rs = Vec::with_capacity(layers);
         let mut current_graph = graph.clone();
-        let cache_policy = CachePolicy::from_env()?;
-
         for layer in 0..layers {
             let operation = OperationGuard::enter("encode", Some(layer));
             let started = Instant::now();
@@ -237,16 +233,6 @@ where
                 cache_path.map(|p| StoreConfig::new(p, format!("zigzag-tree-r-{layer}"), 0));
             let tree_r =
                 build_tree_r::<Tree>(tree_r_builder, tree_r_config.clone(), leaves, data, layer)?;
-            if cache_policy.tree_r_dontneed {
-                if let Some(config) = tree_r_config {
-                    let path = StoreConfig::data_path(&config.path, &config.id);
-                    let file = std::fs::File::open(path)?;
-                    // Synchronization is mandatory before advice, and remains inside the TreeR
-                    // interval. FFI still syncs all artifacts before publishing AUX last.
-                    file.sync_all()?;
-                    discard_file(&file);
-                }
-            }
             log::info!(target: "zigzag_precommit", "phase=tree_r layer={} elapsed_ms={}", layer, started.elapsed().as_millis());
             operation.finish();
             layer_comm_rs.push(tree_r.root());

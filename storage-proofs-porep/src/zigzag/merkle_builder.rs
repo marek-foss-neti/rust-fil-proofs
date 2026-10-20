@@ -33,6 +33,7 @@ use serde::Serialize;
 use storage_proofs_core::merkle::{create_base_merkle_tree, MerkleTreeTrait, MerkleTreeWrapper};
 use tempfile::NamedTempFile;
 
+use super::dirty_writeback::{with_dirty_budget, DirtyBudget, DirtyStats};
 use super::measurements::OperationGuard;
 
 const NODE_BYTES: usize = 32;
@@ -217,14 +218,13 @@ impl LeafSnapshot {
         dirty_limit: Option<usize>,
     ) -> Result<CompletedTree> {
         let operation = OperationGuard::enter("tree_r_build", Some(layer));
-        let dirty = dirty_limit.map(DirtyBudget::new).transpose()?;
         let (root, stats) = build_levels_with_dirty_budget(
             self.file.as_file(),
             self.geometry,
             CHUNK_PAIRS,
             MAX_WORKERS,
             cancelled,
-            dirty.as_ref(),
+            dirty_limit,
         )?;
         check_cancelled(cancelled)?;
         operation.finish();
@@ -451,37 +451,6 @@ pub(crate) fn write_all_at(
     Ok(())
 }
 
-/// Bounds builder-owned dirty writes. Writes and a periodic sync_data share the
-/// lock, so no worker can keep dirtying this file while another flushes it.
-/// Clean page cache and the active replica are outside this per-store bound.
-pub(crate) struct DirtyBudget {
-    limit: usize,
-    bytes: Mutex<usize>,
-}
-impl DirtyBudget {
-    pub(crate) fn new(limit: usize) -> Result<Self> {
-        ensure!(limit > 0, "empty TreeR dirty budget");
-        Ok(Self {
-            limit,
-            bytes: Mutex::new(0),
-        })
-    }
-    pub(crate) fn write(&self, io: &impl PositionedIo, data: &[u8], offset: u64) -> Result<()> {
-        ensure!(data.len() <= self.limit, "TreeR write exceeds dirty budget");
-        let mut bytes = self
-            .bytes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *bytes > self.limit - data.len() {
-            io.sync_data().context("flush TreeR dirty budget")?;
-            *bytes = 0;
-        }
-        write_all_at(io, data, offset)?;
-        *bytes += data.len();
-        Ok(())
-    }
-}
-
 #[derive(Default, Debug, Serialize)]
 struct BuildStats {
     workers: usize,
@@ -497,6 +466,9 @@ struct BuildStats {
     write_ns: u64,
     // One I/O thread, separate from the summed hash-worker intervals above.
     writeback_submit_ns: u64,
+    // Present only for the bounded pipeline path. Flushes overlap hash-worker
+    // intervals; budget_wait is already included in write_ns.
+    dirty_budget: Option<DirtyStats>,
 }
 
 struct Worker {
@@ -522,7 +494,7 @@ impl Worker {
         count: usize,
         read: u64,
         write: u64,
-        dirty: Option<&DirtyBudget>,
+        dirty: Option<&DirtyBudget<'_>>,
     ) -> Result<()> {
         let started = Instant::now();
         read_exact_at(io, &mut self.input[..count * 64], read)?;
@@ -585,8 +557,25 @@ fn build_levels_with_dirty_budget(
     chunk_pairs: usize,
     max_workers: usize,
     cancelled: &AtomicBool,
-    dirty: Option<&DirtyBudget>,
+    dirty_limit: Option<usize>,
 ) -> Result<([u8; 32], BuildStats)> {
+    if let Some(limit) = dirty_limit {
+        // Replace the advisory writeback thread with one credit-returning flush
+        // worker. Never run two I/O workers for the same construction job.
+        let ((root, mut stats), dirty_stats) = with_dirty_budget(io, limit, cancelled, |dirty| {
+            build_levels_inner(
+                io,
+                geometry,
+                chunk_pairs,
+                max_workers,
+                cancelled,
+                None,
+                Some(dirty),
+            )
+        })?;
+        stats.dirty_budget = Some(dirty_stats);
+        return Ok((root, stats));
+    }
     // Linux may block even when submitting writeback without WAIT flags. One
     // scoped thread overlaps that wait with hashing; a one-entry queue bounds
     // outstanding ranges. It never reads/writes caller-owned replica bytes.
@@ -615,8 +604,8 @@ fn build_levels_with_dirty_budget(
             chunk_pairs,
             max_workers,
             cancelled,
-            &sender,
-            dirty,
+            Some(&sender),
+            None,
         );
         if result.is_err() {
             cancelled.store(true, Ordering::Relaxed);
@@ -639,8 +628,8 @@ fn build_levels_inner(
     chunk_pairs: usize,
     max_workers: usize,
     cancelled: &AtomicBool,
-    writeback: &std::sync::mpsc::SyncSender<(u64, u64)>,
-    dirty: Option<&DirtyBudget>,
+    writeback: Option<&std::sync::mpsc::SyncSender<(u64, u64)>>,
+    dirty: Option<&DirtyBudget<'_>>,
 ) -> Result<([u8; 32], BuildStats)> {
     check_cancelled(cancelled)?;
     ensure!(
@@ -657,7 +646,9 @@ fn build_levels_inner(
         .max(1);
     let capacity = chunk_pairs.min(geometry.leaves / 2);
     let mut states: Vec<_> = (0..workers).map(|_| Worker::new(capacity)).collect();
-    writeback.send((0, geometry.leaf_bytes as u64))?;
+    if let Some(writeback) = writeback {
+        writeback.send((0, geometry.leaf_bytes as u64))?;
+    }
     let mut width = geometry.leaves;
     let mut read_start = 0;
     while width > 1 {
@@ -700,10 +691,12 @@ fn build_levels_inner(
         check_cancelled(cancelled)?;
         // Submit completed levels while the CPU hashes the next one, avoiding
         // deferring all buffered I/O to the final sync. No page is discarded.
-        writeback.send((
-            (write_start * NODE_BYTES) as u64,
-            (parents * NODE_BYTES) as u64,
-        ))?;
+        if let Some(writeback) = writeback {
+            writeback.send((
+                (write_start * NODE_BYTES) as u64,
+                (parents * NODE_BYTES) as u64,
+            ))?;
+        }
         read_start = write_start;
         width = parents;
     }
