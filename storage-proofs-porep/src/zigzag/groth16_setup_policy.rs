@@ -1,7 +1,7 @@
 //! ZigZag-only resource admission for file-backed parameter generation.
 //! Worker counts change scheduling, never the circuit or parameter byte order.
 
-use std::{fmt, mem::size_of};
+use std::{convert::TryFrom, fmt, mem::size_of};
 
 use anyhow::{ensure, Context, Result};
 use pairing::Engine;

@@ -52,7 +52,8 @@ impl SetupResources {
             budget = budget.min(limit);
         }
         for available in [self.host_available_bytes, self.cgroup_available_bytes]
-            .into_iter()
+            .iter()
+            .copied()
             .flatten()
         {
             budget = budget.min(self.process_anon_bytes.saturating_add(available));
