@@ -38,7 +38,7 @@ use super::measurements::OperationGuard;
 
 const NODE_BYTES: usize = 32;
 const CHUNK_PAIRS: usize = 4096;
-const MAX_WORKERS: usize = 64;
+pub(super) const MAX_TREE_R_WORKERS: usize = 128;
 const SNAPSHOT_CHUNK_BYTES: usize = 1 << 20;
 type BinaryTree = MerkleTreeWrapper<PoseidonHasher, DiskStore<PoseidonDomain>, U2, U0, U0>;
 
@@ -222,7 +222,7 @@ impl LeafSnapshot {
             self.file.as_file(),
             self.geometry,
             CHUNK_PAIRS,
-            MAX_WORKERS,
+            MAX_TREE_R_WORKERS,
             cancelled,
             dirty_limit,
         )?;
@@ -636,7 +636,7 @@ fn build_levels_inner(
         chunk_pairs > 0
             && chunk_pairs <= CHUNK_PAIRS
             && max_workers > 0
-            && max_workers <= MAX_WORKERS,
+            && max_workers <= MAX_TREE_R_WORKERS,
         "invalid TreeR buffer bounds"
     );
     let chunks = (geometry.leaves / 2).div_ceil(chunk_pairs);

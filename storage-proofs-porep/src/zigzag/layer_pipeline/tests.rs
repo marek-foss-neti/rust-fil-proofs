@@ -32,10 +32,17 @@ fn feed(writer: &mut SnapshotWriter, data: &[u8], forward: bool, chunk: usize) -
 
 #[test]
 fn pipeline_settings_reject_incompatible_builders_and_bounds() {
-    for value in ["", "0", "65", "-1", "+2", " 2", "99999999999999999999999"] {
-        assert!(parse_bound(value, "test").is_err());
+    for value in ["", "0", "129", "-1", "+2", " 2", "99999999999999999999999"] {
+        assert!(parse_bound(value, "threads", MAX_TREE_R_WORKERS).is_err());
     }
-    assert_eq!(parse_bound("64", "test").unwrap(), 64);
+    for threads in [64, 96, 128] {
+        assert_eq!(
+            parse_bound(&threads.to_string(), "threads", MAX_TREE_R_WORKERS).unwrap(),
+            threads
+        );
+    }
+    assert_eq!(parse_bound("64", "snapshot", 64).unwrap(), 64);
+    assert!(parse_bound("65", "snapshot", 64).is_err());
     let config = LayerPipelineConfig {
         mode: LayerPipelineMode::Stream,
         tree_threads: Some(2),
@@ -45,6 +52,48 @@ fn pipeline_settings_reject_incompatible_builders_and_bounds() {
         .validate::<Tree>(TreeRBuilder::Legacy, Some(Path::new(".")))
         .is_err());
     assert!(config.validate::<Tree>(TreeRBuilder::Binary, None).is_err());
+    for threads in [96, 128] {
+        assert!(LayerPipelineConfig {
+            mode: LayerPipelineMode::Sequential,
+            tree_threads: Some(threads),
+            ..config
+        }
+        .validate::<Tree>(TreeRBuilder::Binary, None)
+        .is_ok());
+    }
+    for (threads, buffer) in [(0, 64), (129, 64), (128, 65)] {
+        assert!(LayerPipelineConfig {
+            mode: LayerPipelineMode::Sequential,
+            tree_threads: Some(threads),
+            snapshot_buffer_mib: buffer,
+        }
+        .validate::<Tree>(TreeRBuilder::Binary, None)
+        .is_err());
+    }
+}
+
+#[test]
+fn tree_pool_scales_to_available_threads_and_preserves_encoder_headroom() {
+    let auto = LayerPipelineConfig {
+        mode: LayerPipelineMode::Stream,
+        tree_threads: None,
+        snapshot_buffer_mib: 64,
+    };
+    for (total, expected) in [(1, 1), (2, 1), (32, 29), (96, 93), (128, 125), (256, 128)] {
+        assert_eq!(auto.effective_tree_threads(total, 3), expected);
+    }
+    assert_eq!(auto.effective_tree_threads(96, 1), 95);
+    let explicit = LayerPipelineConfig {
+        tree_threads: Some(128),
+        ..auto
+    };
+    assert_eq!(explicit.effective_tree_threads(96, 3), 93);
+    assert_eq!(explicit.effective_tree_threads(256, 3), 128);
+    let explicit = LayerPipelineConfig {
+        tree_threads: Some(16),
+        ..auto
+    };
+    assert_eq!(explicit.effective_tree_threads(96, 3), 16);
 }
 
 #[test]
