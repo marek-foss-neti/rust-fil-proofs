@@ -29,10 +29,12 @@ use bellperson::gpu;
 use ec_gpu_gen::threadpool::Worker;
 use rayon::prelude::*;
 
+use super::groth16_setup_policy::SetupWorkers;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SetupLimits {
     pub batch_points: usize,
-    pub workers: usize,
+    pub workers: SetupWorkers,
     pub budget_bytes: u64,
 }
 
@@ -46,22 +48,49 @@ impl SetupLimits {
             }
         }
         let batch_points = read("FIL_PROOFS_ZIGZAG_SETUP_BATCH_POINTS", 65_536)?;
-        let workers = read("FIL_PROOFS_ZIGZAG_SETUP_WORKERS", 16)?;
+        let workers = match std::env::var("FIL_PROOFS_ZIGZAG_SETUP_WORKERS") {
+            Ok(raw) => SetupWorkers::parse(&raw)?,
+            Err(std::env::VarError::NotPresent) => SetupWorkers::Auto,
+            Err(error) => return Err(error.into()),
+        };
         let budget_bytes = read("FIL_PROOFS_ZIGZAG_SETUP_BUDGET_BYTES", 100_000_000_000)?;
+        Self::new(batch_points, workers, budget_bytes)
+    }
+
+    fn new(batch_points: u64, workers: SetupWorkers, budget_bytes: u64) -> anyhow::Result<Self> {
         anyhow::ensure!(
             batch_points > 0 && batch_points <= usize::MAX as u64,
             "invalid ZigZag setup batch size"
         );
         anyhow::ensure!(
-            workers > 0 && workers <= 32,
-            "ZigZag setup workers must be 1..=32"
+            workers
+                .fixed()
+                .is_none_or(|workers| (1..=128).contains(&workers)),
+            "ZigZag setup workers must be 1..=128"
         );
         anyhow::ensure!(budget_bytes > 0, "invalid ZigZag setup memory budget");
         Ok(Self {
             batch_points: batch_points as usize,
-            workers: workers as usize,
+            workers,
             budget_bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod worker_limit_tests {
+    use super::{SetupLimits, SetupWorkers};
+
+    #[test]
+    fn setup_accepts_large_hosts_and_rejects_out_of_range_workers() {
+        for workers in [1, 16, 32, 64, 96, 128] {
+            let limits = SetupLimits::new(65_536, SetupWorkers::Fixed(workers), 40 << 30).unwrap();
+            assert_eq!(limits.workers.fixed(), Some(workers));
+        }
+        for workers in [0, 129, usize::MAX] {
+            assert!(SetupLimits::new(65_536, SetupWorkers::Fixed(workers), 40 << 30).is_err());
+        }
+        assert!(SetupLimits::new(65_536, SetupWorkers::Auto, 40 << 30).is_ok());
     }
 }
 
@@ -302,8 +331,14 @@ where
     let delta_inverse = Option::from(delta.invert()).ok_or(SynthesisError::UnexpectedIdentity)?;
 
     let worker = Worker::new();
+    // This in-memory implementation is only the explicit-worker test reference.
+    // Automatic admission belongs to the production file-backed generator.
+    let workers = limits
+        .workers
+        .fixed()
+        .ok_or(SynthesisError::Unsatisfiable)?;
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(limits.workers)
+        .num_threads(workers)
         .build()
         .expect("ZigZag setup worker pool");
 

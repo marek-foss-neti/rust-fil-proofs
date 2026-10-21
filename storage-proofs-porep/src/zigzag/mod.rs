@@ -13,6 +13,7 @@ mod dirty_writeback;
 pub mod encode_prehash;
 pub(crate) mod groth16_setup;
 pub(crate) mod groth16_setup_disk;
+mod groth16_setup_policy;
 pub mod layer_pipeline;
 pub mod measurements;
 pub mod merkle_builder;

@@ -28,6 +28,9 @@ use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 
 use super::groth16_setup::SetupLimits;
+use super::groth16_setup_policy::{
+    check_nonworker_memory, SetupMemory, SetupResources, WorkerPlan,
+};
 
 const RECORD_INDEX_BYTES: usize = 8;
 const RECORD_ROW_BYTES: usize = 8;
@@ -549,7 +552,12 @@ fn checked_memory_floor<E: Engine>(m: usize, n: usize, limits: SetupLimits) -> R
     let m = u64::try_from(m)?;
     let n = u64::try_from(n)?;
     let b = u64::try_from(limits.batch_points)?;
-    let w = u64::try_from(limits.workers)?;
+    let w = u64::try_from(
+        limits
+            .workers
+            .fixed()
+            .context("manual setup memory check needs a worker count")?,
+    )?;
     // Two domains cover the IFFT workspace; one Lagrange domain and three
     // field arrays coexist during QAP accumulation. These are lower bounds,
     // with headroom still needed for libraries and file cache. Query scratch
@@ -581,6 +589,18 @@ fn checked_memory_floor<E: Engine>(m: usize, n: usize, limits: SetupLimits) -> R
     log::info!("zigzag_setup memory_floor_bytes={} domain_bytes={} qap_bytes={} batch_bytes={} io_buffer_bytes={} budget_bytes={}",
         peak_floor, domain, qap, batch, io_buffers, limits.budget_bytes);
     Ok(peak_floor)
+}
+
+fn manual_workers(phase: &str, limits: SetupLimits, items: usize) -> usize {
+    let requested = limits.workers.fixed().expect("explicit setup workers");
+    let workers = requested.min(items.max(1));
+    log::info!(target: "zigzag_setup", "zigzag_setup_workers {}", serde_json::json!({
+        "phase": phase, "requested_workers": requested.to_string(), "workers": workers,
+        "batch_points": limits.batch_points, "configured_budget_bytes": limits.budget_bytes,
+        "effective_budget_bytes": limits.budget_bytes, "limiting_factors": ["explicit"],
+        "memory_limit": null, "resources": null,
+    }));
+    workers
 }
 
 pub(crate) fn generate_random_parameters_to_file<E, C, R>(
@@ -643,7 +663,11 @@ where
     C: Circuit<E::Fr>,
 {
     ensure!(
-        limits.batch_points > 0 && limits.workers > 0,
+        limits.batch_points > 0
+            && limits
+                .workers
+                .fixed()
+                .is_none_or(|n| (1..=128).contains(&n)),
         "ZigZag setup requires nonzero B/W"
     );
     fs::create_dir_all(scratch_dir)?;
@@ -678,7 +702,26 @@ where
         scratch_dir,
         u64::try_from(maximum_query_bytes)?.saturating_mul(2),
     )?;
-    checked_memory_floor::<E>(m, n, limits)?;
+    let auto_memory = if limits.workers.fixed().is_none() {
+        let resources = SetupResources::detect().context("detect ZigZag auto setup resources")?;
+        let memory = SetupMemory::new::<E>(m, n, num_inputs, limits.batch_points)?;
+        let initial_anon = resources.process_anon_bytes;
+        check_nonworker_memory(memory, limits, initial_anon, resources, 0)?;
+        // Reject an impossible later query phase before spending time on H/FFT.
+        WorkerPlan::auto(
+            "queries",
+            limits,
+            n,
+            memory.query_fixed_bytes,
+            memory.query_worker_bytes,
+            initial_anon,
+            resources,
+        )?;
+        Some((memory, initial_anon))
+    } else {
+        checked_memory_floor::<E>(m, n, limits)?;
+        None
+    };
     log::info!("zigzag_setup phase=synthesis elapsed_ms={} inputs={} aux={} constraints={} domain={} records_a={} records_b={} records_c={}",
         started.elapsed().as_millis(), num_inputs, num_aux, num_constraints, m,
         records[0].count, records[1].count, records[2].count);
@@ -716,7 +759,22 @@ where
     let h_started = Instant::now();
     mark_phase("setup_h")?;
     let h_len = m - 1;
-    let h_workers = limits.workers.min(h_len.max(1));
+    let h_workers = if let Some((memory, initial_anon)) = auto_memory {
+        let resources = SetupResources::detect().context("refresh ZigZag H setup resources")?;
+        let plan = WorkerPlan::auto(
+            "h",
+            limits,
+            h_len,
+            memory.h_fixed_bytes,
+            memory.h_worker_bytes,
+            initial_anon,
+            resources,
+        )?;
+        plan.log();
+        plan.workers
+    } else {
+        manual_workers("h", limits, h_len)
+    };
     let h_segments = std::thread::scope(|scope| -> Result<Vec<FinishedSegment>> {
         let mut handles = Vec::with_capacity(h_workers);
         for index in 0..h_workers {
@@ -757,6 +815,15 @@ where
             .sum::<u64>()
     );
 
+    if let Some((memory, initial_anon)) = auto_memory {
+        check_nonworker_memory(
+            memory,
+            limits,
+            initial_anon,
+            SetupResources::detect().context("refresh ZigZag domain/QAP setup resources")?,
+            memory.h_fixed_bytes,
+        )?;
+    }
     let ifft_started = Instant::now();
     mark_phase("setup_ifft")?;
     powers_of_tau.ifft(&worker, &mut None)?;
@@ -789,7 +856,24 @@ where
 
     let query_started = Instant::now();
     mark_phase("setup_eval_input_aux")?;
-    let query_workers = limits.workers.min(n.max(1));
+    let query_workers = if let Some((memory, initial_anon)) = auto_memory {
+        // Re-read host/cgroup pressure and retained process allocations after
+        // H, IFFT and QAP, before any query worker allocates its point buffers.
+        let resources = SetupResources::detect().context("refresh ZigZag auto setup resources")?;
+        let plan = WorkerPlan::auto(
+            "queries",
+            limits,
+            n,
+            memory.query_fixed_bytes,
+            memory.query_worker_bytes,
+            initial_anon,
+            resources,
+        )?;
+        plan.log();
+        plan.workers
+    } else {
+        manual_workers("queries", limits, n)
+    };
     let query_parts = std::thread::scope(
         |scope| -> Result<Vec<(Vec<E::G1Affine>, [FinishedSegment; 4])>> {
             let mut handles = Vec::with_capacity(query_workers);
@@ -994,9 +1078,31 @@ mod tests {
     fn limits(batch_points: usize, workers: usize) -> SetupLimits {
         SetupLimits {
             batch_points,
-            workers,
+            workers: super::super::groth16_setup_policy::SetupWorkers::Fixed(workers),
             budget_bytes: 1_000_000_000,
         }
+    }
+
+    #[test]
+    fn memory_floor_accounts_for_large_worker_pools() {
+        let mut small = limits(65_536, 16);
+        small.budget_bytes = 40 << 30;
+        let small_floor = checked_memory_floor::<Bls12>(8, 8, small).unwrap();
+        let large = SetupLimits {
+            workers: super::super::groth16_setup_policy::SetupWorkers::Fixed(128),
+            ..small
+        };
+        let large_floor = checked_memory_floor::<Bls12>(8, 8, large).unwrap();
+        assert!(large_floor > small_floor);
+        assert!(checked_memory_floor::<Bls12>(
+            8,
+            8,
+            SetupLimits {
+                budget_bytes: small_floor + 1,
+                ..large
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -1047,7 +1153,11 @@ mod tests {
             .expect("serialize bounded setup");
         assert_eq!(bounded_bytes, reference_bytes);
         for batch in [1, 2, 3, 7] {
-            for workers in [1, 2] {
+            for workers in [
+                super::super::groth16_setup_policy::SetupWorkers::Fixed(1),
+                super::super::groth16_setup_policy::SetupWorkers::Fixed(2),
+                super::super::groth16_setup_policy::SetupWorkers::Auto,
+            ] {
                 let scratch = tempfile::tempdir().expect("scratch");
                 let mut output = Vec::new();
                 let vk = generate_parameters_to_file::<Bls12, _>(
@@ -1059,7 +1169,10 @@ mod tests {
                     gamma,
                     delta,
                     tau,
-                    limits(batch, workers),
+                    SetupLimits {
+                        workers,
+                        ..limits(batch, 1)
+                    },
                     scratch.path(),
                     &mut output,
                 )

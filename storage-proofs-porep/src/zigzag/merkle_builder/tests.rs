@@ -107,6 +107,49 @@ fn snapshot_is_independent_and_buffers_are_bounded_with_partial_chunks() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn large_worker_pool_preserves_tree_bytes_and_buffer_bounds() {
+    let directory = tempfile::tempdir().unwrap();
+    let leaves = 512;
+    let bytes = data(leaves);
+    let reference_config = StoreConfig::new(directory.path(), "reference-large-pool", 0);
+    let expected =
+        create_base_merkle_tree::<BinaryTree>(Some(reference_config.clone()), leaves, &bytes)
+            .unwrap();
+    let expected_bytes = fs::read(StoreConfig::data_path(
+        &reference_config.path,
+        &reference_config.id,
+    ))
+    .unwrap();
+    for workers in [96, 128] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        let config = StoreConfig::new(directory.path(), format!("workers-{workers}"), 0);
+        let cancelled = AtomicBool::new(false);
+        let snapshot = LeafSnapshot::capture(config, leaves, &bytes, 0, &cancelled).unwrap();
+        let (root, stats) = pool
+            .install(|| {
+                build_levels(
+                    snapshot.file.as_file(),
+                    snapshot.geometry,
+                    2,
+                    workers,
+                    &cancelled,
+                )
+            })
+            .unwrap();
+        let expected_root: [u8; 32] = expected.root().into();
+        assert_eq!(root, expected_root);
+        assert_eq!(stats.workers, workers);
+        assert_eq!(stats.buffer_allocations, 3 * workers);
+        assert_eq!(stats.buffer_bytes, workers * 2 * 160);
+        assert_eq!(fs::read(snapshot.file.path()).unwrap(), expected_bytes);
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn failed_or_cancelled_build_never_publishes_and_allows_retry() {
     let directory = tempfile::tempdir().unwrap();
     let config = StoreConfig::new(directory.path(), "retry", 0);

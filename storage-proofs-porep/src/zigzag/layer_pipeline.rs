@@ -17,7 +17,7 @@ use storage_proofs_core::{drgraph::Graph, merkle::MerkleTreeTrait, settings::SET
 
 use super::dirty_writeback::with_dirty_budget;
 use super::measurements::{OperationGuard, WaitStats};
-use super::merkle_builder::{supports_binary, LeafSnapshot, TreeRBuilder};
+use super::merkle_builder::{supports_binary, LeafSnapshot, TreeRBuilder, MAX_TREE_R_WORKERS};
 use super::vanilla::{vde, ZigZagBucketGraph};
 
 const CHUNK_BYTES: usize = 1 << 20;
@@ -51,12 +51,16 @@ impl LayerPipelineConfig {
         let tree_threads = match std::env::var("FIL_PROOFS_ZIGZAG_TREE_R_THREADS") {
             Err(std::env::VarError::NotPresent) => None,
             Ok(value) if value == "auto" => None,
-            Ok(value) => Some(parse_bound(&value, "FIL_PROOFS_ZIGZAG_TREE_R_THREADS")?),
+            Ok(value) => Some(parse_bound(
+                &value,
+                "FIL_PROOFS_ZIGZAG_TREE_R_THREADS",
+                MAX_TREE_R_WORKERS,
+            )?),
             _ => bail!("invalid FIL_PROOFS_ZIGZAG_TREE_R_THREADS"),
         };
         let snapshot_buffer_mib = match std::env::var("FIL_PROOFS_ZIGZAG_SNAPSHOT_BUFFER_MIB") {
             Err(std::env::VarError::NotPresent) => 64,
-            Ok(value) => parse_bound(&value, "FIL_PROOFS_ZIGZAG_SNAPSHOT_BUFFER_MIB")?,
+            Ok(value) => parse_bound(&value, "FIL_PROOFS_ZIGZAG_SNAPSHOT_BUFFER_MIB", 64)?,
             _ => bail!("invalid FIL_PROOFS_ZIGZAG_SNAPSHOT_BUFFER_MIB"),
         };
         Ok(Self {
@@ -76,8 +80,9 @@ impl LayerPipelineConfig {
             "snapshot pool must be 1..64 MiB"
         );
         ensure!(
-            self.tree_threads.is_none_or(|n| (1..=64).contains(&n)),
-            "TreeR workers must be 1..64"
+            self.tree_threads
+                .is_none_or(|n| (1..=MAX_TREE_R_WORKERS).contains(&n)),
+            "TreeR workers must be 1..={MAX_TREE_R_WORKERS}"
         );
         if self.mode != LayerPipelineMode::Sequential {
             ensure!(builder == TreeRBuilder::Binary && supports_binary::<Tree>() && cache.is_some(),
@@ -85,15 +90,25 @@ impl LayerPipelineConfig {
         }
         Ok(())
     }
+
+    fn effective_tree_threads(self, total: usize, encode_threads: usize) -> usize {
+        let ceiling = total
+            .saturating_sub(encode_threads)
+            .clamp(1, MAX_TREE_R_WORKERS);
+        self.tree_threads.unwrap_or(ceiling).min(ceiling)
+    }
 }
 
-fn parse_bound(value: &str, name: &str) -> Result<usize> {
+fn parse_bound(value: &str, name: &str, maximum: usize) -> Result<usize> {
     ensure!(
         !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
-        "{name} must be 1..64"
+        "{name} must be 1..={maximum}"
     );
     let value: usize = value.parse().with_context(|| format!("invalid {name}"))?;
-    ensure!((1..=64).contains(&value), "{name} must be 1..64");
+    ensure!(
+        (1..=maximum).contains(&value),
+        "{name} must be 1..={maximum}"
+    );
     Ok(value)
 }
 
@@ -177,8 +192,7 @@ pub(crate) fn replicate<Tree: 'static + MerkleTreeTrait>(
     } else {
         1
     };
-    let ceiling = total.saturating_sub(encode_threads).clamp(1, 64);
-    let tree_threads = config.tree_threads.unwrap_or(ceiling).min(ceiling);
+    let tree_threads = config.effective_tree_threads(total, encode_threads);
     // Build the pool before encoder affinity narrows the caller's CPU mask.
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
