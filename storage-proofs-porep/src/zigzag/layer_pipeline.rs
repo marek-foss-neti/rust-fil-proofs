@@ -183,6 +183,10 @@ pub(crate) fn replicate<Tree: 'static + MerkleTreeTrait>(
     config: LayerPipelineConfig,
 ) -> Result<Vec<Tree>> {
     config.validate::<Tree>(TreeRBuilder::Binary, Some(cache))?;
+    let gpu = super::merkle_builder::gpu::TreeRGpuConfig::start::<Tree>(
+        TreeRBuilder::Binary,
+        Some(cache),
+    )?;
     let total = rayon::current_num_threads();
     let encode_threads = if SETTINGS.zigzag_multicore_encode {
         SETTINGS
@@ -192,16 +196,25 @@ pub(crate) fn replicate<Tree: 'static + MerkleTreeTrait>(
     } else {
         1
     };
-    let tree_threads = config.effective_tree_threads(total, encode_threads);
+    let tree_threads = if gpu.is_some() {
+        0
+    } else {
+        config.effective_tree_threads(total, encode_threads)
+    };
     // Build the pool before encoder affinity narrows the caller's CPU mask.
-    let pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(tree_threads)
-            .thread_name(|n| format!("zigzag-tree-{n}"))
-            .build()?,
-    );
+    let pool = if gpu.is_some() {
+        None
+    } else {
+        Some(Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(tree_threads)
+                .thread_name(|n| format!("zigzag-tree-{n}"))
+                .build()?,
+        ))
+    };
     log::info!(target: "zigzag_pipeline", "zigzag_pipeline {}", serde_json::json!({
         "mode": config.mode, "tree_threads": tree_threads, "requested_tree_threads": config.tree_threads,
+        "gpu_tree_r": gpu.is_some(),
         "encode_threads": encode_threads, "rayon_threads": total,
         "snapshot_buffer_bytes": if config.mode == LayerPipelineMode::Stream { (config.snapshot_buffer_mib << 20).min(data.len()) } else { 0 },
         "dirty_bytes_per_store": DIRTY_BYTES, "max_building_trees": 1, "max_capturing_trees": 1,
@@ -308,16 +321,22 @@ pub(crate) fn replicate<Tree: 'static + MerkleTreeTrait>(
             trees.push(tree.join()?);
         }
         let pool = pool.clone();
+        let gpu = gpu.clone();
         let cancel = cancelled.clone();
         let handle = thread::Builder::new()
             .name(format!("zigzag-layer-{layer}"))
             .spawn(move || {
                 checked_job(&cancel, || {
-                    let tree = pool.install(|| {
-                        snapshot
-                            .build_with_dirty_limit(layer, &cancel, Some(DIRTY_BYTES))?
-                            .publish::<Tree>(layer, &cancel)
-                    })?;
+                    let tree = match gpu.as_deref() {
+                        Some(gpu) => gpu
+                            .build(snapshot, layer, cancel.clone())?
+                            .publish::<Tree>(layer, &cancel)?,
+                        None => pool.as_ref().expect("CPU TreeR pool").install(|| {
+                            snapshot
+                                .build_with_dirty_limit(layer, &cancel, Some(DIRTY_BYTES))?
+                                .publish::<Tree>(layer, &cancel)
+                        })?,
+                    };
                     tree_operation.finish();
                     Ok(tree)
                 })

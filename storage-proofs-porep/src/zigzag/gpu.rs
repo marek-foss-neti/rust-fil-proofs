@@ -1,4 +1,4 @@
-//! Process-local configuration and admission for the existing Bellperson GPU prover.
+//! Shared ZigZag device admission for Bellperson proving and Neptune TreeR.
 //!
 //! This module does not implement kernels or claim execution from device discovery.
 //! Benchmark acceptance uses an external CUDA trace and CPU proof verification.
@@ -71,14 +71,18 @@ impl Backend {
     }
 }
 
-/// Holds the device admission lock for an entire C2, across its bounded batches.
-/// Bellperson's own priority-aware locks remain in force inside each batch.
+/// Holds device admission for one C2 or TreeR worker, across bounded batches.
+/// Bellperson's priority-aware file protocol remains in force inside each batch.
 pub(crate) struct ProvingGuard {
     _lock: Option<File>,
 }
 
 impl ProvingGuard {
     pub(crate) fn enter() -> Result<Self> {
+        Self::enter_for("groth16_c2")
+    }
+
+    pub(crate) fn enter_for(operation: &str) -> Result<Self> {
         let started = Instant::now();
         let requested =
             env::var("FIL_PROOFS_ZIGZAG_GPU_BACKEND").unwrap_or_else(|_| "auto".to_owned());
@@ -91,6 +95,7 @@ impl ProvingGuard {
             env::var_os("BELLPERSON_GPUS_PER_LOCK").is_some(),
         )?;
         let mut details = json!({
+            "operation": operation,
             "requested_backend": requested,
             "cuda_compiled": cfg!(feature = "cuda"),
             "opencl_compiled": cfg!(feature = "opencl"),
@@ -158,6 +163,31 @@ impl ProvingGuard {
         log::info!(target: "zigzag_gpu", "zigzag_gpu {}", details);
         Ok(Self { _lock: lock })
     }
+}
+
+/// Neptune does not participate in Bellperson's locks. Explicit TreeR workers
+/// use the same device admission and global/priority lock namespace as C2/PoSt.
+pub(crate) fn validate_tree_gpu_backend() -> Result<()> {
+    let backend = Backend::parse(&env::var("FIL_PROOFS_ZIGZAG_GPU_BACKEND").unwrap_or_default())?;
+    ensure!(
+        matches!(backend, Backend::Cuda | Backend::Opencl),
+        "GPU TreeR requires an explicit cuda or opencl ZigZag worker"
+    );
+    backend.validate(
+        env::var("BELLMAN_NO_GPU").is_ok_and(|v| v != "0"),
+        env::var("EC_GPU_FRAMEWORK").ok().as_deref(),
+        env::var_os("BELLPERSON_GPUS_PER_LOCK").is_some(),
+    )?;
+    let directory = env::var("FIL_PROOFS_ZIGZAG_GPU_LOCK_DIR")?;
+    ensure!(
+        std::path::Path::new(&directory).is_absolute(),
+        "GPU lock directory must be absolute"
+    );
+    ensure!(
+        std::fs::canonicalize(directory)? == std::fs::canonicalize(env::temp_dir())?,
+        "GPU TreeR and Bellperson must share TMPDIR and FIL_PROOFS_ZIGZAG_GPU_LOCK_DIR"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

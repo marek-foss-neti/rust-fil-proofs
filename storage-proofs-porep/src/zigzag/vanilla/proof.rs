@@ -218,6 +218,10 @@ where
             ));
         }
 
+        let gpu = crate::zigzag::merkle_builder::gpu::TreeRGpuConfig::start::<Tree>(
+            tree_r_builder,
+            cache_path,
+        )?;
         let mut replica_trees: Vec<Tree> = Vec::with_capacity(layers);
         let mut layer_comm_rs = Vec::with_capacity(layers);
         let mut current_graph = graph.clone();
@@ -231,8 +235,14 @@ where
             let started = Instant::now();
             let tree_r_config =
                 cache_path.map(|p| StoreConfig::new(p, format!("zigzag-tree-r-{layer}"), 0));
-            let tree_r =
-                build_tree_r::<Tree>(tree_r_builder, tree_r_config.clone(), leaves, data, layer)?;
+            let tree_r = build_tree_r::<Tree>(
+                tree_r_builder,
+                tree_r_config.clone(),
+                leaves,
+                data,
+                layer,
+                gpu.as_deref(),
+            )?;
             log::info!(target: "zigzag_precommit", "phase=tree_r layer={} elapsed_ms={}", layer, started.elapsed().as_millis());
             operation.finish();
             layer_comm_rs.push(tree_r.root());

@@ -1,4 +1,4 @@
-//! Bounded CPU construction of ZigZag's full binary Poseidon DiskStore.
+//! Bounded CPU/GPU construction of ZigZag's full binary Poseidon DiskStore.
 //!
 //! Adapts the level barriers and independent chunk work of merkletree's DiskStore
 //! builder used by SDR. The shared builder, hashers and store format are unchanged.
@@ -35,6 +35,8 @@ use tempfile::NamedTempFile;
 
 use super::dirty_writeback::{with_dirty_budget, DirtyBudget, DirtyStats};
 use super::measurements::OperationGuard;
+
+pub mod gpu;
 
 const NODE_BYTES: usize = 32;
 const CHUNK_PAIRS: usize = 4096;
@@ -74,6 +76,7 @@ pub(crate) fn build_tree_r<Tree: 'static + MerkleTreeTrait>(
     leaves: usize,
     data: &[u8],
     layer: usize,
+    gpu: Option<&gpu::TreeGpuWorker>,
 ) -> Result<Tree> {
     if builder == TreeRBuilder::Legacy || config.is_none() || !supports_binary::<Tree>() {
         log::info!(target: "zigzag_merkle", "zigzag_merkle {}", serde_json::json!({
@@ -82,7 +85,7 @@ pub(crate) fn build_tree_r<Tree: 'static + MerkleTreeTrait>(
         }));
         return create_base_merkle_tree::<Tree>(config, leaves, data);
     }
-    let cancelled = AtomicBool::new(false);
+    let cancelled = std::sync::Arc::new(AtomicBool::new(false));
     let snapshot = LeafSnapshot::capture(
         config.context("missing TreeR config")?,
         leaves,
@@ -90,7 +93,10 @@ pub(crate) fn build_tree_r<Tree: 'static + MerkleTreeTrait>(
         layer,
         &cancelled,
     )?;
-    let completed = snapshot.build(layer, &cancelled)?;
+    let completed = match gpu {
+        Some(gpu) => gpu.build(snapshot, layer, cancelled.clone())?,
+        None => snapshot.build(layer, &cancelled)?,
+    };
     completed.publish::<Tree>(layer, &cancelled)
 }
 
@@ -293,7 +299,7 @@ impl CompletedTree {
             "builder": "binary", "layer": layer, "leaves": geometry.leaves,
             "file_bytes": geometry.file_bytes, "stats": stats,
             "timing_scope": "read/conversion/hash_serialize/write: summed hash-worker intervals; writeback_submit: one I/O thread; overlapping, not additive to TreeR wall time",
-            "allocation_scope": "builder-owned buffers only; excludes shared Poseidon constants, Rayon and page cache",
+            "allocation_scope": "buffer_bytes: builder-owned vectors; GPU stats separately account for Neptune result copies and a constants allowance; excludes driver context/modules, allocator overhead, Rayon and page cache",
         }));
         Ok(tree)
     }
@@ -469,6 +475,8 @@ struct BuildStats {
     // Present only for the bounded pipeline path. Flushes overlap hash-worker
     // intervals; budget_wait is already included in write_ns.
     dirty_budget: Option<DirtyStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu: Option<gpu::GpuBuildStats>,
 }
 
 struct Worker {

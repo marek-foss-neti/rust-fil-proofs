@@ -53,6 +53,7 @@ fn complete_store_matches_reference_across_chunk_boundaries_and_reopens() {
             leaves,
             &input,
             0,
+            None,
         )
         .unwrap();
         assert_eq!(expected.root(), actual.root());
@@ -167,9 +168,20 @@ fn failed_or_cancelled_build_never_publishes_and_allows_retry() {
     cancelled.store(true, Ordering::Relaxed);
     assert!(snapshot.build(0, &cancelled).is_err());
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
-    build_tree_r::<BinaryTree>(TreeRBuilder::Binary, Some(config.clone()), 16, &input, 0).unwrap();
+    build_tree_r::<BinaryTree>(
+        TreeRBuilder::Binary,
+        Some(config.clone()),
+        16,
+        &input,
+        0,
+        None,
+    )
+    .unwrap();
     let bytes = fs::read(&final_path).unwrap();
-    assert!(build_tree_r::<BinaryTree>(TreeRBuilder::Binary, Some(config), 16, &input, 0).is_err());
+    assert!(
+        build_tree_r::<BinaryTree>(TreeRBuilder::Binary, Some(config), 16, &input, 0, None)
+            .is_err()
+    );
     assert_eq!(fs::read(final_path).unwrap(), bytes);
 }
 
@@ -309,16 +321,22 @@ fn physical_preallocation_failure_leaves_no_store() {
     let directory = tempfile::tempdir_in(path).unwrap();
     let config = StoreConfig::new(directory.path(), "no-space", 0);
     let input = data(65536); // Full store needs almost 4 MiB; fixture mount is 1 MiB.
-    let error =
-        build_tree_r::<BinaryTree>(TreeRBuilder::Binary, Some(config.clone()), 65536, &input, 0)
-            .unwrap_err();
+    let error = build_tree_r::<BinaryTree>(
+        TreeRBuilder::Binary,
+        Some(config.clone()),
+        65536,
+        &input,
+        0,
+        None,
+    )
+    .unwrap_err();
     assert_eq!(
         error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
         Some(libc::ENOSPC)
     );
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     // A smaller retry on the same config can succeed because no artifact escaped.
-    build_tree_r::<BinaryTree>(TreeRBuilder::Binary, Some(config), 16, &data(16), 0).unwrap();
+    build_tree_r::<BinaryTree>(TreeRBuilder::Binary, Some(config), 16, &data(16), 0, None).unwrap();
 }
 
 #[test]
