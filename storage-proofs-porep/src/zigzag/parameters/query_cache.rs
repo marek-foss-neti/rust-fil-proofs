@@ -10,7 +10,9 @@ use std::{env, sync::Mutex};
 use super::*;
 
 const GIB: u64 = 1 << 30;
-const MEMORY_CEILING: u64 = 60 * GIB;
+const MAX_SETTING_BYTES: u64 = 100 * GIB;
+// Total process allowance includes the base reserve and retained query cache.
+const MEMORY_CEILING: u64 = 120 * GIB;
 const DEFAULT_RESERVE: u64 = 56 * GIB;
 const FAMILIES: [&str; 5] = ["h", "l", "a", "b_g1", "b_g2"];
 
@@ -31,7 +33,7 @@ impl QueryCacheConfig {
                 Err(env::VarError::NotPresent) => Ok(default),
                 Ok(raw) if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) => {
                     let parsed: u64 = raw.parse().with_context(|| format!("invalid {name}"))?;
-                    ensure!(parsed <= MEMORY_CEILING, "{name} exceeds 60 GiB");
+                    ensure!(parsed <= MAX_SETTING_BYTES, "{name} exceeds 100 GiB");
                     Ok(parsed)
                 }
                 _ => anyhow::bail!("{name} must be an unsigned byte count"),
@@ -321,7 +323,19 @@ mod tests {
         );
         assert_eq!(
             QueryCacheConfig::with_limit(8 * GIB, 56 * GIB, Some(80 * GIB)).effective_bytes,
-            4 * GIB
+            8 * GIB
+        );
+        assert_eq!(
+            QueryCacheConfig::with_limit(20 * GIB, 100 * GIB, Some(120 * GIB)).effective_bytes,
+            20 * GIB
+        );
+        assert_eq!(
+            QueryCacheConfig::with_limit(20 * GIB, 100 * GIB, Some(110 * GIB)).effective_bytes,
+            10 * GIB
+        );
+        assert_eq!(
+            QueryCacheConfig::with_limit(30 * GIB, 100 * GIB, Some(128 * GIB)).effective_bytes,
+            20 * GIB
         );
         assert_eq!(
             QueryCacheConfig::with_limit(4 * GIB, 56 * GIB, None).effective_bytes,
@@ -385,7 +399,11 @@ mod tests {
             QueryCacheConfig::with_limit(4 * GIB, 56 * GIB, limit).effective_bytes,
             4 * GIB
         );
-        std::fs::write(root.path().join("worker/memory.max"), (58 * GIB).to_string()).unwrap();
+        std::fs::write(
+            root.path().join("worker/memory.max"),
+            (58 * GIB).to_string(),
+        )
+        .unwrap();
         assert_eq!(
             limit_in_hierarchy(root.path(), "/worker/job", "memory.max"),
             Some(58 * GIB)

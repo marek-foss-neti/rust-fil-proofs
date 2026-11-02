@@ -10,7 +10,7 @@ use crate::{
 };
 
 pub const NAME: &str = "zigzag-512";
-pub const LAYERS: usize = 11;
+pub const LAYERS: usize = 17;
 pub const PARTITIONS: u8 = 10;
 pub const MINIMUM_CHALLENGES: usize = 176;
 pub const CHALLENGES_PER_LAYER: usize = 18;
@@ -50,7 +50,12 @@ mod tests {
         assert_eq!(setup.expansion_degree, reference_setup.expansion_degree);
         assert_eq!(setup.porep_id, reference_setup.porep_id);
         assert_eq!(setup.api_version, reference_setup.api_version);
-        assert_eq!(setup.layer_challenges, reference_setup.layer_challenges);
+        // The benchmark has 17 layers; registered 32 GiB proofs retain 11.
+        assert_eq!(reference_setup.layer_challenges.layers(), 11);
+        assert_eq!(
+            setup.layer_challenges.challenges_for_layer(0),
+            reference_setup.layer_challenges.challenges_for_layer(0)
+        );
         assert_eq!(config.partitions.0, reference.partitions.0);
         assert_eq!(config.minimum_challenges(), reference.minimum_challenges());
         assert_eq!(setup.layer_challenges.layers(), LAYERS);
