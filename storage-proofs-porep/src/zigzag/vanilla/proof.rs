@@ -303,10 +303,17 @@ where
             layer_graph = Self::transform(&layer_graph);
         }
 
+        let mut decode_session = super::decode_parents::DecodeSession::new()?;
         let (mut input, mut output) = (data, scratch);
         for layer in (0..layers).rev() {
             let started = Instant::now();
-            vde::decode_into(&layer_graph, replica_id, input, output)?;
+            vde::decode_into_with_session(
+                &layer_graph,
+                replica_id,
+                input,
+                output,
+                &mut decode_session,
+            )?;
             log::info!(target: "zigzag_unseal", "phase=decode layer={} elapsed_ms={}", layer, started.elapsed().as_millis());
             std::mem::swap(&mut input, &mut output);
             layer_graph = Self::invert_transform(&layer_graph);

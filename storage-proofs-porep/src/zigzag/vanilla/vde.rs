@@ -9,7 +9,9 @@ use blstrs::Scalar as Fr;
 use ff::PrimeField;
 use filecoin_hashers::{Domain, Hasher};
 use fr32::bytes_into_fr_repr_safe;
-use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
 use sha2::{Digest, Sha256};
 use storage_proofs_core::{
     drgraph::Graph,
@@ -24,6 +26,7 @@ use crate::zigzag::cache_policy::{discard_file, CachePolicy};
 use crate::zigzag::encode_prehash::{EncodePrehash, PreparedHash, SHA_BLOCK_BYTES};
 use crate::zigzag::measurements::WaitStats;
 use crate::zigzag::vanilla::cores::EncodeAffinity;
+use crate::zigzag::vanilla::decode_parents::{DecodeParentReader, DecodeSession, ReadStats};
 use crate::zigzag::vanilla::graph::ZigZagGraph;
 use crate::zigzag::vanilla::parent_table::ZigZagParentTable;
 
@@ -697,12 +700,68 @@ where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
+    decode_into_with_session(graph, replica_id, data, out, &mut DecodeSession::new()?)
+}
+
+pub(super) fn decode_into_with_session<H, G>(
+    graph: &ZigZagGraph<H, G>,
+    replica_id: &H::Domain,
+    data: &[u8],
+    out: &mut [u8],
+    session: &mut DecodeSession,
+) -> Result<()>
+where
+    H: Hasher,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+{
     ensure_graph_data_len(graph, data)?;
     ensure!(
         out.len() == data.len(),
         "ZigZag decode output size mismatch"
     );
     let use_parent_table = SETTINGS.use_zigzag_parent_cache;
+    let config = session.config;
+    if use_parent_table && config.parent_reader != DecodeParentReader::Legacy {
+        let started = Instant::now();
+        let layout = config.layout(graph.size(), graph.degree(), rayon::current_num_threads())?;
+        let source = session.source(graph)?;
+        // Allocate a fixed number of cursors before spawning tasks. Rayon may split
+        // work arbitrarily, but cannot multiply these buffers via task initializers.
+        let readers = (0..layout.readers)
+            .map(|_| source.reader(layout.buffer_nodes))
+            .collect::<Result<Vec<_>>>()?;
+        let stripe_bytes = layout
+            .stripe_nodes
+            .checked_mul(NODE_SIZE)
+            .context("ZigZag decode stripe size overflow")?;
+        let stats = out
+            .par_chunks_mut(stripe_bytes)
+            .zip(readers.into_par_iter())
+            .enumerate()
+            .map(|(stripe, (chunk, mut reader))| -> Result<ReadStats> {
+                let mut scratch = DecodeScratch::new(graph.degree());
+                let base_node = stripe * layout.stripe_nodes;
+                for (chunk_node, node_out) in chunk.chunks_mut(NODE_SIZE).enumerate() {
+                    let node = base_node + chunk_node;
+                    reader.read_into(node, &mut scratch.parents)?;
+                    decode_from_parents::<H>(replica_id, data, node, &mut scratch)
+                        .write_bytes(node_out)?;
+                }
+                Ok(reader.stats)
+            })
+            .try_reduce(ReadStats::default, |left, right| Ok(left.merge(right)))?;
+        log::info!(target: "zigzag_unseal", "zigzag_decode_parents {}", serde_json::json!({
+            "event": "layer", "reader": config.parent_reader, "reversed": graph.reversed(),
+            "nodes": graph.size(), "layout": layout, "io": stats,
+            "remaps": 0, "elapsed_ns": started.elapsed().as_nanos(),
+        }));
+        return Ok(());
+    }
+
+    log::info!(target: "zigzag_unseal", "zigzag_decode_parents {}", serde_json::json!({
+        "event": "layer_start", "reader": if use_parent_table { "legacy" } else { "graph" },
+        "requested_reader": config.parent_reader, "reversed": graph.reversed(), "nodes": graph.size(),
+    }));
 
     out.par_chunks_mut(DECODE_CHUNK_NODES * NODE_SIZE)
         .enumerate()
@@ -784,10 +843,19 @@ where
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     fill_parents(graph, parent_table, v, &mut scratch.parents)?;
+    Ok(decode_from_parents::<H>(replica_id, data, v, scratch))
+}
+
+fn decode_from_parents<H: Hasher>(
+    replica_id: &H::Domain,
+    data: &[u8],
+    v: usize,
+    scratch: &mut DecodeScratch,
+) -> H::Domain {
     let key = create_key_with_scratch::<H>(replica_id, v, &scratch.parents, data, &mut scratch.key);
     let node_data = domain_at_node_unchecked::<H>(data, v);
 
-    Ok(encode::decode(key, node_data))
+    encode::decode(key, node_data)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1237,6 +1305,71 @@ mod tests {
     #[test]
     fn encode_decode_reversed() {
         encode_decode_roundtrip(true);
+    }
+
+    #[test]
+    fn decode_readers_preserve_layers_orientations_and_worker_counts() -> Result<()> {
+        use super::super::decode_parents::DecodeConfig;
+        let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+            None,
+            32768,
+            BASE_DEGREE,
+            EXP_DEGREE,
+            [62; 32],
+            ApiVersion::V1_2_0,
+        )?;
+        let replica_id = PoseidonDomain::default();
+        let mut original = vec![0; graph.size() * NODE_SIZE];
+        for (index, node) in original.chunks_exact_mut(NODE_SIZE).enumerate() {
+            node[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        }
+        for graph in [graph.clone(), graph.zigzag()] {
+            let mut encoded = original.clone();
+            let mut encoding_graph = graph.clone();
+            for layer_count in 1..=17 {
+                encode(&encoding_graph, &replica_id, &mut encoded)?;
+                if [2, 11, 17].contains(&layer_count) {
+                    for mode in [
+                        DecodeParentReader::Legacy,
+                        DecodeParentReader::Buffered,
+                        DecodeParentReader::Mmap,
+                    ] {
+                        for workers in [1, 4] {
+                            let pool = rayon::ThreadPoolBuilder::new()
+                                .num_threads(workers)
+                                .build()?;
+                            pool.install(|| -> Result<()> {
+                                let mut session = DecodeSession::with_config(DecodeConfig {
+                                    parent_reader: mode,
+                                    parent_buffer_mib: 1,
+                                });
+                                let mut input = encoded.clone();
+                                let mut output = vec![0xa5; input.len()];
+                                let mut decoding_graph = encoding_graph.clone();
+                                for _ in 0..layer_count {
+                                    decode_into_with_session(
+                                        &decoding_graph,
+                                        &replica_id,
+                                        &input,
+                                        &mut output,
+                                        &mut session,
+                                    )?;
+                                    std::mem::swap(&mut input, &mut output);
+                                    decoding_graph = decoding_graph.zigzag();
+                                }
+                                assert_eq!(
+                                    input, original,
+                                    "reader={mode:?} workers={workers} layers={layer_count}"
+                                );
+                                Ok(())
+                            })?;
+                        }
+                    }
+                }
+                encoding_graph = encoding_graph.zigzag();
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use anyhow::{ensure, Context};
 use byteorder::{ByteOrder, LittleEndian};
@@ -32,6 +32,12 @@ use crate::zigzag::vanilla::graph::ZigZagGraph;
 const NODE_BYTES: usize = 4;
 const PARENT_TABLE_MANIFEST_VERSION: u32 = 1;
 const HASH_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Serialize)]
+pub(super) struct ParentTableOpenStats {
+    process_lock_wait_ns: u128,
+    file_lock_wait_ns: u128,
+}
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -245,9 +251,25 @@ impl ZigZagParentTable {
         H: Hasher,
         G: Graph<H> + ParameterSetMetadata + Send + Sync,
     {
+        let (file, _) = Self::verified_file_at_path(graph, path)?;
+        Self::open(graph, path, file)
+    }
+
+    // Share the validated descriptor with decode readers. Publication, validation and
+    // reads must refer to the same inode, even if the cache pathname is replaced.
+    pub(super) fn verified_file_at_path<H, G>(
+        graph: &ZigZagGraph<H, G>,
+        path: &Path,
+    ) -> Result<(LockedFile, ParentTableOpenStats)>
+    where
+        H: Hasher,
+        G: Graph<H> + ParameterSetMetadata + Send + Sync,
+    {
+        let started = Instant::now();
         let _process_guard = ZIGZAG_PARENT_TABLE_ACCESS_LOCK
             .lock()
             .map_err(|_| anyhow::anyhow!("zigzag parent table process lock poisoned"))?;
+        let process_lock_wait_ns = started.elapsed().as_nanos();
         ensure_parent_directory(path)?;
 
         let lock_path = lock_path(path);
@@ -263,12 +285,17 @@ impl ZigZagParentTable {
                     lock_path.display()
                 )
             })?;
+        let started = Instant::now();
         lock_file.lock_exclusive().with_context(|| {
             format!(
                 "could not lock zigzag parent table lock={}",
                 lock_path.display()
             )
         })?;
+        let stats = ParentTableOpenStats {
+            process_lock_wait_ns,
+            file_lock_wait_ns: started.elapsed().as_nanos(),
+        };
 
         let result = (|| {
             remove_stale_temp_files(path)?;
@@ -288,7 +315,7 @@ impl ZigZagParentTable {
                 }
             };
 
-            Self::open(graph, path, file)
+            Ok(file)
         })();
 
         let unlock_result = FileExt::unlock(&lock_file).with_context(|| {
@@ -299,7 +326,7 @@ impl ZigZagParentTable {
         });
 
         match (result, unlock_result) {
-            (Ok(table), Ok(())) => Ok(table),
+            (Ok(file), Ok(())) => Ok((file, stats)),
             (Err(err), _) => Err(err),
             (Ok(_), Err(err)) => Err(err),
         }
@@ -798,7 +825,7 @@ where
         .context("zigzag parent table size overflow")
 }
 
-fn cache_path<H, G>(graph: &ZigZagGraph<H, G>) -> PathBuf
+pub(super) fn cache_path<H, G>(graph: &ZigZagGraph<H, G>) -> PathBuf
 where
     H: Hasher,
     G: Graph<H> + ParameterSetMetadata + Send + Sync,
