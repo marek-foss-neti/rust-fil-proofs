@@ -1,11 +1,11 @@
-//! Benchmark-only ZigZag profile. This is deliberately separate from registered sector rules.
+//! Benchmark-only ZigZag profiles, separate from registered sector rules.
 
 use std::sync::OnceLock;
 
 use storage_proofs_core::api_version::ApiVersion;
 
 use crate::{
-    constants::{SECTOR_SIZE_32_GIB, SECTOR_SIZE_512_MIB},
+    constants::{SECTOR_SIZE_32_GIB, SECTOR_SIZE_512_MIB, SECTOR_SIZE_8_MIB},
     types::{PoRepConfig, SectorSize},
 };
 
@@ -14,6 +14,10 @@ pub const LAYERS: usize = 17;
 pub const PARTITIONS: u8 = 10;
 pub const MINIMUM_CHALLENGES: usize = 176;
 pub const CHALLENGES_PER_LAYER: usize = 18;
+pub const DEV_NAME: &str = "zigzag-8";
+pub const DEV_PARTITIONS: u8 = 2;
+pub const DEV_CHALLENGES_PER_LAYER: usize = 2;
+pub const DEV_MINIMUM_CHALLENGES: usize = DEV_PARTITIONS as usize * DEV_CHALLENGES_PER_LAYER;
 static POREP_ID: OnceLock<[u8; 32]> = OnceLock::new();
 
 /// Carry the 32 GiB ZigZag proof budget onto 512 MiB data geometry.
@@ -26,17 +30,61 @@ pub fn config(porep_id: [u8; 32], api_version: ApiVersion) -> PoRepConfig {
     config
 }
 
+/// Exercise the full multilayer and multipartition workflow with a small development proof.
+pub fn config_8mib(porep_id: [u8; 32], api_version: ApiVersion) -> PoRepConfig {
+    let mut config = config(porep_id, api_version);
+    config.sector_size = SectorSize(SECTOR_SIZE_8_MIB);
+    config.partitions.0 = DEV_PARTITIONS;
+    config
+}
+
 pub(crate) fn is_config(config: &PoRepConfig) -> bool {
     POREP_ID.get() == Some(&config.porep_id)
-        && u64::from(config.sector_size) == SECTOR_SIZE_512_MIB
-        && config.partitions.0 == PARTITIONS
+        && matches!(
+            (u64::from(config.sector_size), config.partitions.0),
+            (SECTOR_SIZE_512_MIB, PARTITIONS) | (SECTOR_SIZE_8_MIB, DEV_PARTITIONS)
+        )
         && config.api_features.is_empty()
+}
+
+pub(crate) fn minimum_challenges(config: &PoRepConfig) -> Option<usize> {
+    is_config(config).then(|| {
+        if u64::from(config.sector_size) == SECTOR_SIZE_8_MIB {
+            DEV_MINIMUM_CHALLENGES
+        } else {
+            MINIMUM_CHALLENGES
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parameters::zigzag_setup_params;
+
+    #[test]
+    fn development_profile_preserves_layers_with_a_small_multipartition_proof() {
+        let config = config_8mib([0; 32], ApiVersion::V1_2_0);
+        let setup = zigzag_setup_params(&config).unwrap();
+        assert_eq!(setup.nodes, 1 << 18);
+        assert_eq!(setup.layer_challenges.layers(), 17);
+        assert_eq!(config.partitions.0, 2);
+        assert_eq!(config.minimum_challenges(), 4);
+        for layer in 0..17 {
+            assert_eq!(setup.layer_challenges.challenges_for_layer(layer), 2);
+        }
+        let regular = PoRepConfig::new_groth16(SECTOR_SIZE_8_MIB, [0; 32], ApiVersion::V1_2_0);
+        let regular_setup = zigzag_setup_params(&regular).unwrap();
+        assert!(!is_config(&regular));
+        assert_eq!(regular.partitions.0, 1);
+        assert_eq!(regular.minimum_challenges(), 2);
+        assert_eq!(regular_setup.layer_challenges.layers(), 2);
+        assert_eq!(setup.degree, regular_setup.degree);
+        assert_eq!(setup.expansion_degree, regular_setup.expansion_degree);
+        let mut unrelated = config;
+        unrelated.porep_id = [1; 32];
+        assert!(!is_config(&unrelated));
+    }
 
     #[test]
     fn setup_has_512_mib_geometry_and_32_gib_proof_budget() {
