@@ -2,6 +2,7 @@
 //! workers read the sector; copy-back happens after the Rayon join/barrier.
 use std::{ops::Range, sync::atomic::AtomicBool, time::Instant};
 
+use crate::zigzag::decode_cpu::{CpuLayer, CpuStats, CpuWorker, DecodeCpuConfig};
 use anyhow::{ensure, Context, Result};
 use filecoin_hashers::{Domain, Hasher};
 use rayon::prelude::*;
@@ -33,7 +34,7 @@ pub fn decode_in_place_with_block<H, G>(
     cancelled: Option<&AtomicBool>,
 ) -> Result<()>
 where
-    H: Hasher,
+    H: Hasher + 'static,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     decode_with_session(
@@ -55,13 +56,19 @@ pub(in crate::zigzag::vanilla) fn decode_with_session<H, G>(
     session: &mut DecodeSession,
 ) -> Result<()>
 where
-    H: Hasher,
+    H: Hasher + 'static,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     ensure_graph_data_len(graph, data)?;
     validate_block(data.len(), block.len())?;
     check_cancelled(cancelled)?;
-    let mut decoder = LayerDecoder::new(graph, block.len().min(data.len()) / NODE_SIZE, session)?;
+    let mut decoder = LayerDecoder::new(
+        graph,
+        replica_id,
+        data,
+        block.len().min(data.len()) / NODE_SIZE,
+        session,
+    )?;
     let times = visit_blocks(
         data,
         block,
@@ -102,7 +109,7 @@ pub(in crate::zigzag::vanilla) fn stream_with_session<H, G>(
     mut emit: impl FnMut(usize, &[u8]) -> Result<()>,
 ) -> Result<()>
 where
-    H: Hasher,
+    H: Hasher + 'static,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     ensure_graph_data_len(graph, data)?;
@@ -118,7 +125,13 @@ where
     if range.is_empty() {
         return Ok(());
     }
-    let mut decoder = LayerDecoder::new(graph, block.len().min(range.len()) / NODE_SIZE, session)?;
+    let mut decoder = LayerDecoder::new(
+        graph,
+        replica_id,
+        data,
+        block.len().min(range.len()) / NODE_SIZE,
+        session,
+    )?;
     let mut blocks = 0;
     let mut decode_join_ns = 0;
     for start in (range.start..range.end).step_by(block.len()) {
@@ -148,32 +161,74 @@ where
     Ok(())
 }
 
+/// Reuse the bounded worker/reader setup for the optional CPU kernel in ping-pong mode.
+pub(super) fn decode_into_cpu<H, G>(
+    graph: &ZigZagGraph<H, G>,
+    replica_id: &H::Domain,
+    data: &[u8],
+    out: &mut [u8],
+    session: &mut DecodeSession,
+) -> Result<()>
+where
+    H: Hasher + 'static,
+    G: Graph<H> + ParameterSetMetadata + Sync + Send,
+{
+    let mut decoder = LayerDecoder::new(graph, replica_id, data, graph.size(), session)?;
+    decoder.decode(graph, replica_id, data, out, 0, None)?;
+    decoder.log_parents(graph)
+}
+
 struct LayerDecoder<'a> {
     source: Option<&'a DecodeParentSource>,
     workers: Vec<Worker<'a>>,
     layout: ReaderLayout,
     reader: DecodeParentReader,
     use_table: bool,
+    cpu: Option<CpuLayer>,
+    requested_cpu: DecodeCpuConfig,
 }
 
 impl<'a> LayerDecoder<'a> {
     fn new<H, G>(
         graph: &ZigZagGraph<H, G>,
+        replica_id: &H::Domain,
+        state: &[u8],
         block_nodes: usize,
         session: &'a mut DecodeSession,
     ) -> Result<Self>
     where
-        H: Hasher,
+        H: Hasher + 'static,
         G: Graph<H> + ParameterSetMetadata + Sync + Send,
     {
         let config = session.config;
+        let requested_cpu = session.cpu;
+        use std::any::TypeId;
+        // Only these concrete hashers promise the canonical LE scalar representation.
+        // Arbitrary downstream Domain implementations retain encode::decode conversion.
+        let canonical_domain = TypeId::of::<H>()
+            == TypeId::of::<filecoin_hashers::poseidon::PoseidonHasher>()
+            || TypeId::of::<H>() == TypeId::of::<filecoin_hashers::sha256::Sha256Hasher>()
+            || TypeId::of::<H>() == TypeId::of::<filecoin_hashers::blake2s::Blake2sHasher>();
+        let cpu = CpuLayer::new(
+            requested_cpu,
+            graph.size(),
+            graph.degree(),
+            graph.forward(),
+            AsRef::<[u8]>::as_ref(replica_id),
+            state,
+            canonical_domain,
+        )?;
         let use_table = SETTINGS.use_zigzag_parent_cache;
         let mut effective_config = config;
         if !use_table {
             effective_config.parent_reader = DecodeParentReader::Legacy;
         }
-        let layout =
-            effective_config.layout(block_nodes, graph.degree(), rayon::current_num_threads())?;
+        let threads = if requested_cpu.enabled() {
+            requested_cpu.worker_limit()
+        } else {
+            rayon::current_num_threads()
+        };
+        let layout = effective_config.layout(block_nodes, graph.degree(), threads)?;
         let source = if use_table && config.parent_reader != DecodeParentReader::Legacy {
             Some(session.source(graph)?)
         } else {
@@ -189,6 +244,7 @@ impl<'a> LayerDecoder<'a> {
                         None
                     },
                     scratch: DecodeScratch::new(graph.degree()),
+                    cpu: cpu.as_ref().map(|layer| CpuWorker::new(layer.config)),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -198,6 +254,8 @@ impl<'a> LayerDecoder<'a> {
             layout,
             reader: config.parent_reader,
             use_table,
+            cpu,
+            requested_cpu,
         })
     }
 
@@ -223,6 +281,7 @@ impl<'a> LayerDecoder<'a> {
             output.len().div_ceil(stripe_bytes) <= self.workers.len(),
             "decode worker coverage mismatch"
         );
+        let cpu = self.cpu.as_ref();
         output
             .par_chunks_mut(stripe_bytes)
             .zip(self.workers.par_iter_mut())
@@ -230,6 +289,28 @@ impl<'a> LayerDecoder<'a> {
             .try_for_each(|(stripe, (chunk, worker))| -> Result<()> {
                 check_cancelled(cancelled)?;
                 let base = base_node + stripe * stripe_nodes;
+                if let (Some(layer), Some(cpu)) = (cpu, worker.cpu.as_mut()) {
+                    let cursor = &mut worker.cursor;
+                    let legacy = &mut worker.legacy;
+                    return cpu.decode(
+                        layer,
+                        state,
+                        chunk,
+                        base,
+                        cancelled,
+                        |node, parents| {
+                            if let Some(reader) = cursor.as_mut() {
+                                reader.read_into(node, parents)
+                            } else {
+                                fill_parents(graph, legacy, node, parents)
+                            }
+                        },
+                        |key, value, out| {
+                            crate::encode::decode::<H::Domain>(key.into(), value.into())
+                                .write_bytes(out)
+                        },
+                    );
+                }
                 for (index, out) in chunk.chunks_exact_mut(NODE_SIZE).enumerate() {
                     if index % 1024 == 0 {
                         check_cancelled(cancelled)?;
@@ -266,6 +347,21 @@ impl<'a> LayerDecoder<'a> {
         H: Hasher,
         G: Graph<H> + ParameterSetMetadata + Sync + Send,
     {
+        if let Some(cpu) = &self.cpu {
+            let stats = self
+                .workers
+                .iter()
+                .filter_map(|w| w.cpu.as_ref())
+                .fold(CpuStats::default(), |stats, worker| {
+                    stats.merge(&worker.stats)
+                });
+            cpu.log(&stats, self.layout.readers);
+        } else if self.requested_cpu.enabled() {
+            log::info!(target: "zigzag_unseal", "zigzag_decode_cpu {}", serde_json::json!({
+                "event": "fallback", "requested": self.requested_cpu,
+                "reason": "unsupported_parent_degree_or_replica_id_size", "reversed": graph.reversed(),
+            }));
+        }
         let io = self.source.map(|_| {
             self.workers
                 .iter()
@@ -288,6 +384,7 @@ struct Worker<'a> {
     cursor: Option<DecodeParentCursor<'a>>,
     legacy: Option<ZigZagParentTable>,
     scratch: DecodeScratch,
+    cpu: Option<CpuWorker>,
 }
 
 #[cfg(test)]

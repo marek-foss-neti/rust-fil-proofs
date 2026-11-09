@@ -138,17 +138,21 @@ pub(super) struct ReaderLayout {
 /// Rayon tasks never acquire the publication or verification locks.
 pub(super) struct DecodeSession {
     pub config: DecodeConfig,
+    pub cpu: crate::zigzag::decode_cpu::DecodeCpuConfig,
     sources: HashMap<PathBuf, DecodeParentSource>,
 }
 
 impl DecodeSession {
     pub fn new() -> Result<Self> {
-        Ok(Self::with_config(DecodeConfig::from_env()?))
+        let mut session = Self::with_config(DecodeConfig::from_env()?);
+        session.cpu = crate::zigzag::decode_cpu::DecodeCpuConfig::from_env()?;
+        Ok(session)
     }
 
     pub fn with_config(config: DecodeConfig) -> Self {
         Self {
             config,
+            cpu: Default::default(),
             sources: HashMap::new(),
         }
     }

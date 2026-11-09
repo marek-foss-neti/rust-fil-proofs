@@ -35,6 +35,9 @@ const DECODE_CHUNK_NODES: usize = 16 * 1024;
 pub(super) mod blockwise;
 pub use blockwise::decode_in_place_with_block;
 
+#[cfg(test)]
+mod decode_cpu_tests;
+
 #[derive(Default, serde::Serialize)]
 struct FeederStats {
     producer: usize,
@@ -680,7 +683,7 @@ pub fn decode<H, G>(
     data: &[u8],
 ) -> Result<Vec<u8>>
 where
-    H: Hasher,
+    H: Hasher + 'static,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     ensure_graph_data_len(graph, data)?;
@@ -700,7 +703,7 @@ pub fn decode_into<H, G>(
     out: &mut [u8],
 ) -> Result<()>
 where
-    H: Hasher,
+    H: Hasher + 'static,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     decode_into_with_session(graph, replica_id, data, out, &mut DecodeSession::new()?)
@@ -714,7 +717,7 @@ pub(super) fn decode_into_with_session<H, G>(
     session: &mut DecodeSession,
 ) -> Result<()>
 where
-    H: Hasher,
+    H: Hasher + 'static,
     G: Graph<H> + ParameterSetMetadata + Sync + Send,
 {
     ensure_graph_data_len(graph, data)?;
@@ -722,6 +725,9 @@ where
         out.len() == data.len(),
         "ZigZag decode output size mismatch"
     );
+    if session.cpu.enabled() {
+        return blockwise::decode_into_cpu(graph, replica_id, data, out, session);
+    }
     let use_parent_table = SETTINGS.use_zigzag_parent_cache;
     let config = session.config;
     if use_parent_table && config.parent_reader != DecodeParentReader::Legacy {
