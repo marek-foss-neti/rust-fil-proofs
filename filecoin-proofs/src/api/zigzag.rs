@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{ensure, Context, Result};
 use ff::PrimeField;
 use filecoin_hashers::Hasher;
-use fr32::{bytes_into_fr_repr_safe, write_unpadded};
+use fr32::bytes_into_fr_repr_safe;
 use merkletree::{merkle::MerkleTree, store::StoreConfig};
 use serde::{Deserialize, Serialize};
 use storage_proofs_core::{
@@ -57,6 +57,8 @@ use crate::{
 use typenum::Unsigned;
 
 mod tree_d;
+mod unseal_output;
+pub use unseal_output::{ZigZagUnsealOutputConfig, ZigZagUnsealOutputMode};
 
 type TreeDomain<Tree> = <<Tree as MerkleTreeTrait>::Hasher as Hasher>::Domain;
 
@@ -1121,6 +1123,69 @@ pub fn zigzag_unseal_range_with_block<Tree: 'static + MerkleTreeTrait, W: Write>
     write_zigzag_unseal_range(data, &mut unsealed_output, offset, num_bytes)
 }
 
+/// Write unpadded bytes directly from final-layer chunks. Intermediate layers
+/// are still decoded in full. `data` and `scratch` are disposable private state;
+/// unlike the in-place APIs, no complete padded result is retained in them.
+/// `scratch` is a sector for ping-pong or a bounded, 128-byte-aligned block for
+/// blockwise mode. On any error discard private state and reset/replace output
+/// before retrying from the original sealed replica. Cancellation cannot
+/// interrupt a blocking `Write::write`, but is checked between writes/chunks.
+#[allow(clippy::too_many_arguments)]
+pub fn zigzag_unseal_range_streaming<Tree: 'static + MerkleTreeTrait, W: Write>(
+    porep_config: &PoRepConfig,
+    prover_id: ProverId,
+    sector_id: SectorId,
+    ticket: Ticket,
+    comm_d_in: Commitment,
+    data: &mut [u8],
+    scratch: &mut [u8],
+    decode_mode: storage_proofs_porep::zigzag::decode_state::DecodeMode,
+    mut unsealed_output: W,
+    offset: UnpaddedByteIndex,
+    num_bytes: UnpaddedBytesAmount,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<UnpaddedBytesAmount> {
+    validate_zigzag_sector_data(porep_config, data)?;
+    let range = unseal_output::OutputRange::new(data.len(), offset.0, num_bytes.0)?;
+    if num_bytes.0 == 0 {
+        return Ok(num_bytes);
+    }
+    ensure!(
+        !scratch.is_empty() && scratch.len().is_multiple_of(128),
+        "streaming scratch needs complete FR32 groups"
+    );
+    let output_config = ZigZagUnsealOutputConfig::from_env()?;
+    let chunk_bytes = output_config.chunk_bytes()?.min(scratch.len());
+    let mut output = unseal_output::ParallelOutput::new(
+        &mut unsealed_output,
+        range.clone(),
+        chunk_bytes,
+        cancelled,
+        true,
+    )?;
+    let pub_params = zigzag_public_params::<Tree>(porep_config)?;
+    let replica_id = generate_replica_id::<Tree::Hasher, _>(
+        &prover_id,
+        sector_id.into(),
+        &ticket,
+        comm_d_in,
+        &porep_config.porep_id,
+    );
+    ZigZagDrgPoRep::<Tree, DefaultPieceHasher>::extract_and_invert_transform_layers_to_sink(
+        &pub_params.graph,
+        &pub_params.layer_challenges,
+        &replica_id,
+        data,
+        scratch,
+        decode_mode,
+        range.padded,
+        chunk_bytes,
+        cancelled,
+        |start, bytes| output.write_chunk(start, bytes),
+    )?;
+    Ok(UnpaddedBytesAmount(output.finish()? as u64))
+}
+
 fn validate_zigzag_unseal_range(
     padded_len: usize,
     offset: UnpaddedByteIndex,
@@ -1144,9 +1209,15 @@ fn write_zigzag_unseal_range<W: Write>(
     if num_bytes.0 == 0 {
         return Ok(UnpaddedBytesAmount(0));
     }
-    // Keep the full padded input and let fr32 translate the unpadded offset, including
-    // offsets inside a 127-byte group. Slicing at a rounded padded byte loses bit alignment.
-    let written = write_unpadded(decoded, output, offset.into(), num_bytes.into())
-        .context("write_unpadded failed")?;
+    // In-place APIs preserve their complete padded result even when the adapter
+    // requests streaming. They can still use the bounded parallel FR32 writer.
+    let written = unseal_output::write_range(
+        decoded,
+        output,
+        offset.0,
+        num_bytes.0,
+        ZigZagUnsealOutputConfig::from_env()?,
+        None,
+    )?;
     Ok(UnpaddedBytesAmount(written as u64))
 }

@@ -377,6 +377,97 @@ where
         }
         Ok(())
     }
+    /// Decode intermediate layers in full, then emit only the requested padded
+    /// final-layer range in ascending order. Unlike the in-place APIs, `data`
+    /// and `scratch` are disposable and do not hold a complete decoded result.
+    /// No sink call overlaps a decoder worker; an error stops future production.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extract_and_invert_transform_layers_to_sink<'a>(
+        graph: &ZigZagBucketGraph<Tree::Hasher>,
+        layer_challenges: &LayerChallenges,
+        replica_id: &<Tree::Hasher as Hasher>::Domain,
+        data: &'a mut [u8],
+        scratch: &'a mut [u8],
+        mode: DecodeMode,
+        range: std::ops::Range<usize>,
+        chunk_bytes: usize,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        emit: impl FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let layers = layer_challenges.layers();
+        ensure!(
+            layers > 0 && data.len() == graph.size() * NODE_SIZE,
+            "invalid ZigZag decode geometry"
+        );
+        ensure!(
+            !scratch.is_empty() && scratch.len().is_multiple_of(NODE_SIZE),
+            "invalid ZigZag scratch size"
+        );
+        ensure!(
+            mode != DecodeMode::PingPong || scratch.len() == data.len(),
+            "ZigZag scratch size mismatch"
+        );
+        ensure!(
+            chunk_bytes > 0 && chunk_bytes.is_multiple_of(NODE_SIZE),
+            "invalid ZigZag output chunk"
+        );
+        ensure!(
+            range.start <= range.end
+                && range.end <= data.len()
+                && range.start.is_multiple_of(NODE_SIZE)
+                && range.end.is_multiple_of(NODE_SIZE),
+            "invalid ZigZag output range"
+        );
+        if range.is_empty() {
+            return Ok(());
+        }
+        let mut layer_graph = graph.clone();
+        if layers % 2 == 0 {
+            layer_graph = Self::transform(&layer_graph);
+        }
+        let mut session = super::decode_parents::DecodeSession::new()?;
+        let (mut input, mut output) = (data, scratch);
+        for layer in (1..layers).rev() {
+            ensure!(
+                !cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)),
+                "ZigZag decode cancelled"
+            );
+            let started = Instant::now();
+            match mode {
+                DecodeMode::PingPong => {
+                    vde::decode_into_with_session(
+                        &layer_graph,
+                        replica_id,
+                        input,
+                        output,
+                        &mut session,
+                    )?;
+                    std::mem::swap(&mut input, &mut output);
+                }
+                DecodeMode::Blockwise => vde::blockwise::decode_with_session(
+                    &layer_graph,
+                    replica_id,
+                    input,
+                    output,
+                    cancelled,
+                    &mut session,
+                )?,
+            }
+            log::info!(target: "zigzag_unseal", "phase=decode layer={} elapsed_ms={}", layer, started.elapsed().as_millis());
+            layer_graph = Self::invert_transform(&layer_graph);
+        }
+        let final_chunk_bytes = chunk_bytes.min(output.len());
+        vde::blockwise::stream_with_session(
+            &layer_graph,
+            replica_id,
+            input,
+            &mut output[..final_chunk_bytes],
+            range,
+            cancelled,
+            &mut session,
+            emit,
+        )
+    }
 }
 
 /// Build the ZigZag public parameters for the given setup parameters.

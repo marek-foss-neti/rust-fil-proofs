@@ -53,6 +53,28 @@ fn every_layer_matches_reference_with_both_orientations_and_partial_blocks() -> 
                                     &mut state, &mut block, None,
                                 )?;
                                 assert_eq!(state, original);
+                                for mode in [crate::zigzag::decode_state::DecodeMode::PingPong,
+                                    crate::zigzag::decode_state::DecodeMode::Blockwise] {
+                                    let mut state = states[layers].clone();
+                                    let mut scratch = vec![0; if mode == crate::zigzag::decode_state::DecodeMode::PingPong {
+                                        state.len()
+                                    } else { 17 * NODE_SIZE }];
+                                    let range = 3 * NODE_SIZE..119 * NODE_SIZE;
+                                    let mut recovered = Vec::new();
+                                    let mut next = range.start;
+                                    ZigZagDrgPoRep::<BinaryMerkleTree<PoseidonHasher>, PoseidonHasher>::extract_and_invert_transform_layers_to_sink(
+                                        &graphs[0], &LayerChallenges::new_fixed(layers, 1), &id,
+                                        &mut state, &mut scratch, mode, range.clone(), 13 * NODE_SIZE, None,
+                                        |offset, bytes| {
+                                            assert_eq!(offset, next);
+                                            next += bytes.len();
+                                            recovered.extend_from_slice(bytes);
+                                            Ok(())
+                                        },
+                                    )?;
+                                    assert_eq!(next, range.end);
+                                    assert_eq!(recovered, original[range]);
+                                }
                             }
                             let mut session = DecodeSession::with_config(DecodeConfig { parent_reader: reader, parent_buffer_mib: 1 });
                             let sealed = states[layers].clone();
@@ -88,6 +110,7 @@ fn block_workers_cover_multiple_stripes_and_global_offsets() -> Result<()> {
         let original = vec![0; graph.size() * NODE_SIZE];
         let mut state = original.clone();
         super::super::encode_sequential(&graph, None, &id, &mut state)?;
+        let encoded = state.clone();
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
         pool.install(|| -> Result<()> {
             let mut session = DecodeSession::with_config(DecodeConfig {
@@ -100,6 +123,103 @@ fn block_workers_cover_multiple_stripes_and_global_offsets() -> Result<()> {
             decode_with_session(&graph, &id, &mut state, &mut block, None, &mut session)
         })?;
         assert_eq!(state, original);
+        for range in [0..encoded.len(), 17 * NODE_SIZE..encoded.len() - NODE_SIZE] {
+            let mut session = DecodeSession::with_config(DecodeConfig {
+                parent_reader: DecodeParentReader::Buffered,
+                parent_buffer_mib: 1,
+            });
+            let mut block = vec![0; 32769 * NODE_SIZE];
+            let mut recovered = Vec::new();
+            pool.install(|| {
+                stream_with_session(
+                    &graph,
+                    &id,
+                    &encoded,
+                    &mut block,
+                    range.clone(),
+                    None,
+                    &mut session,
+                    |_, bytes| {
+                        recovered.extend_from_slice(bytes);
+                        Ok(())
+                    },
+                )
+            })?;
+            assert_eq!(recovered, original[range]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn final_layer_sink_failure_and_cancel_stop_future_chunks_and_preserve_input() -> Result<()> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::Ordering;
+    let graph: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+        None,
+        128,
+        BASE_DEGREE,
+        EXP_DEGREE,
+        [83; 32],
+        ApiVersion::V1_2_0,
+    )?;
+    let id = PoseidonDomain::default();
+    for graph in [graph.clone(), graph.zigzag()] {
+        let original = vec![0; graph.size() * NODE_SIZE];
+        let mut sealed = original.clone();
+        super::super::encode_sequential(&graph, None, &id, &mut sealed)?;
+        let before = sealed.clone();
+        for failure in ["error", "cancel", "panic"] {
+            let cancel = AtomicBool::new(false);
+            let mut block = vec![0; 17 * NODE_SIZE];
+            // Also observe cancellation set by the final sink call, when no
+            // subsequent loop iteration is available to notice it.
+            let end = if failure == "cancel" {
+                block.len()
+            } else {
+                sealed.len()
+            };
+            let mut session = DecodeSession::new()?;
+            let mut calls = 0;
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                stream_with_session(
+                    &graph,
+                    &id,
+                    &sealed,
+                    &mut block,
+                    0..end,
+                    Some(&cancel),
+                    &mut session,
+                    |_, _| {
+                        calls += 1;
+                        match failure {
+                            "error" => anyhow::bail!("injected sink error"),
+                            "cancel" => cancel.store(true, Ordering::Relaxed),
+                            _ => panic!("injected sink panic"),
+                        }
+                        Ok(())
+                    },
+                )
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert_eq!(calls, 1);
+            assert_eq!(sealed, before);
+            let mut recovered = Vec::new();
+            stream_with_session(
+                &graph,
+                &id,
+                &sealed,
+                &mut block,
+                0..sealed.len(),
+                None,
+                &mut session,
+                |_, bytes| {
+                    recovered.extend_from_slice(bytes);
+                    Ok(())
+                },
+            )?;
+            assert_eq!(recovered, original);
+        }
     }
     Ok(())
 }
