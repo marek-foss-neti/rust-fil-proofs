@@ -9,6 +9,7 @@
 
 pub mod cache_policy;
 pub mod circuit;
+pub mod decode_state;
 mod dirty_writeback;
 pub mod encode_prehash;
 pub(crate) mod groth16_setup;

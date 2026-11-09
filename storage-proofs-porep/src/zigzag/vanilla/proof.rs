@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::ensure;
+use anyhow::{ensure, Context};
 use filecoin_hashers::Hasher;
 use merkletree::store::StoreConfig;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use storage_proofs_core::{
     util::NODE_SIZE,
 };
 
+use crate::zigzag::decode_state::{DecodeMode, DecodeStateConfig};
 use crate::zigzag::layer_pipeline::{self, LayerPipelineConfig, LayerPipelineMode};
 use crate::zigzag::measurements::OperationGuard;
 use crate::zigzag::merkle_builder::{build_tree_r, TreeRBuilder};
@@ -263,6 +264,23 @@ where
             data.len() == graph.size() * NODE_SIZE,
             "ZigZag data size mismatch"
         );
+        let config = DecodeStateConfig::from_env()?;
+        if config.mode == DecodeMode::Blockwise {
+            let size = config.block_bytes(data.len())?;
+            let mut block = Vec::new();
+            block
+                .try_reserve_exact(size)
+                .context("allocate ZigZag decode block")?;
+            block.resize(size, 0);
+            return Self::extract_and_invert_transform_layers_with_block(
+                graph,
+                layer_challenges,
+                replica_id,
+                data,
+                &mut block,
+                None,
+            );
+        }
         let mut scratch = vec![0u8; data.len()];
         Self::extract_and_invert_transform_layers_with_scratch(
             graph,
@@ -320,6 +338,44 @@ where
         }
 
         Ok(input)
+    }
+
+    /// Decode all layers in a private sector state with one separate output block.
+    /// The result always resides in `data`, for odd and even layer counts. On any
+    /// failure the private state must be discarded, not resumed; sealed is the retry source.
+    pub fn extract_and_invert_transform_layers_with_block(
+        graph: &ZigZagBucketGraph<Tree::Hasher>,
+        layer_challenges: &LayerChallenges,
+        replica_id: &<Tree::Hasher as Hasher>::Domain,
+        data: &mut [u8],
+        block: &mut [u8],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let layers = layer_challenges.layers();
+        ensure!(layers > 0, "ZigZag requires at least one layer");
+        ensure!(
+            data.len() == graph.size() * NODE_SIZE,
+            "ZigZag data size mismatch"
+        );
+        let mut layer_graph = graph.clone();
+        if layers % 2 == 0 {
+            layer_graph = Self::transform(&layer_graph);
+        }
+        let mut session = super::decode_parents::DecodeSession::new()?;
+        for layer in (0..layers).rev() {
+            let started = Instant::now();
+            vde::blockwise::decode_with_session(
+                &layer_graph,
+                replica_id,
+                data,
+                block,
+                cancelled,
+                &mut session,
+            )?;
+            log::info!(target: "zigzag_unseal", "phase=decode layer={} elapsed_ms={}", layer, started.elapsed().as_millis());
+            layer_graph = Self::invert_transform(&layer_graph);
+        }
+        Ok(())
     }
 }
 

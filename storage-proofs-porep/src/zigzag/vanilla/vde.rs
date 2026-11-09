@@ -32,6 +32,9 @@ use crate::zigzag::vanilla::parent_table::ZigZagParentTable;
 
 const DECODE_CHUNK_NODES: usize = 16 * 1024;
 
+pub(super) mod blockwise;
+pub use blockwise::decode_in_place_with_block;
+
 #[derive(Default, serde::Serialize)]
 struct FeederStats {
     producer: usize,

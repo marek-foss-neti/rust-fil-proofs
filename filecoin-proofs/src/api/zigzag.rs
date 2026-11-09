@@ -1076,6 +1076,51 @@ pub fn zigzag_unseal_range_with_scratch<Tree: 'static + MerkleTreeTrait, W: Writ
     write_zigzag_unseal_range(decoded, &mut unsealed_output, offset, num_bytes)
 }
 
+/// Unseal using one private sector state and a caller-owned, node-aligned output block.
+/// The block is reused across all layers; input and block cannot alias. No sector
+/// allocation or storage policy is hidden here. On error discard `data` and retry
+/// from the original sealed replica. Range offsets are unpadded bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn zigzag_unseal_range_with_block<Tree: 'static + MerkleTreeTrait, W: Write>(
+    porep_config: &PoRepConfig,
+    prover_id: ProverId,
+    sector_id: SectorId,
+    ticket: Ticket,
+    comm_d_in: Commitment,
+    data: &mut [u8],
+    block: &mut [u8],
+    mut unsealed_output: W,
+    offset: UnpaddedByteIndex,
+    num_bytes: UnpaddedBytesAmount,
+) -> Result<UnpaddedBytesAmount> {
+    validate_zigzag_sector_data(porep_config, data)?;
+    validate_zigzag_unseal_range(data.len(), offset, num_bytes)?;
+    if num_bytes.0 == 0 {
+        return Ok(num_bytes);
+    }
+    ensure!(
+        !block.is_empty() && block.len() % NODE_SIZE == 0,
+        "decode block must contain whole nodes"
+    );
+    let pub_params = zigzag_public_params::<Tree>(porep_config)?;
+    let replica_id = generate_replica_id::<Tree::Hasher, _>(
+        &prover_id,
+        sector_id.into(),
+        &ticket,
+        comm_d_in,
+        &porep_config.porep_id,
+    );
+    ZigZagDrgPoRep::<Tree, DefaultPieceHasher>::extract_and_invert_transform_layers_with_block(
+        &pub_params.graph,
+        &pub_params.layer_challenges,
+        &replica_id,
+        data,
+        block,
+        None,
+    )?;
+    write_zigzag_unseal_range(data, &mut unsealed_output, offset, num_bytes)
+}
+
 fn validate_zigzag_unseal_range(
     padded_len: usize,
     offset: UnpaddedByteIndex,

@@ -15,4 +15,7 @@ pub use params::{
     SetupParams, Tau,
 };
 pub use proof::{setup, LayerProof, Proof, ZigZagDrgPoRep};
-pub use vde::{create_key, decode, decode_block, decode_into, encode, prepare_parent_table};
+pub use vde::{
+    create_key, decode, decode_block, decode_in_place_with_block, decode_into, encode,
+    prepare_parent_table,
+};

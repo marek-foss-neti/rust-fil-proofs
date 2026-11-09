@@ -39,7 +39,7 @@ const POREP_ID: [u8; 32] = [42u8; 32];
 
 #[test]
 fn unseal_full_unaligned_ranges_and_invalid_bounds() -> anyhow::Result<()> {
-    use filecoin_proofs::zigzag_unseal_range_with_scratch;
+    use filecoin_proofs::{zigzag_unseal_range_with_block, zigzag_unseal_range_with_scratch};
     let config = PoRepConfig::new_groth16(SECTOR_SIZE_2_KIB, POREP_ID, ApiVersion::V1_2_0);
     let raw: Vec<u8> = (0..2032).map(|i| (i * 31 + i / 7) as u8).collect();
     let mut replica = Vec::new();
@@ -69,11 +69,31 @@ fn unseal_full_unaligned_ranges_and_invalid_bounds() -> anyhow::Result<()> {
         (2031, 1),
         (2032, 0),
     ] {
-        for buffered in [false, true] {
+        for mode in ["inplace", "ping_pong", "blockwise"] {
             let mut data = replica.clone();
-            let mut scratch = vec![0xa5; data.len()];
+            let mut scratch = vec![
+                0xa5;
+                if mode == "blockwise" {
+                    17 * 32
+                } else {
+                    data.len()
+                }
+            ];
             let mut output = Vec::new();
-            let written = if buffered {
+            let written = if mode == "blockwise" {
+                zigzag_unseal_range_with_block::<ZigZagTree, _>(
+                    &config,
+                    PROVER_ID,
+                    SectorId::from(0),
+                    TICKET,
+                    commitments.comm_d,
+                    &mut data,
+                    &mut scratch,
+                    &mut output,
+                    UnpaddedByteIndex(offset),
+                    UnpaddedBytesAmount(size),
+                )?
+            } else if mode == "ping_pong" {
                 zigzag_unseal_range_with_scratch::<ZigZagTree, _>(
                     &config,
                     PROVER_ID,
@@ -108,11 +128,31 @@ fn unseal_full_unaligned_ranges_and_invalid_bounds() -> anyhow::Result<()> {
         }
     }
     for (offset, size) in [(2032, 1), (2033, 0), (u64::MAX, 2)] {
-        for buffered in [false, true] {
+        for mode in ["inplace", "ping_pong", "blockwise"] {
             let mut data = replica.clone();
-            let mut scratch = vec![0xa5; data.len()];
+            let mut scratch = vec![
+                0xa5;
+                if mode == "blockwise" {
+                    17 * 32
+                } else {
+                    data.len()
+                }
+            ];
             let mut output = Vec::new();
-            let result = if buffered {
+            let result = if mode == "blockwise" {
+                zigzag_unseal_range_with_block::<ZigZagTree, _>(
+                    &config,
+                    PROVER_ID,
+                    SectorId::from(0),
+                    TICKET,
+                    commitments.comm_d,
+                    &mut data,
+                    &mut scratch,
+                    &mut output,
+                    UnpaddedByteIndex(offset),
+                    UnpaddedBytesAmount(size),
+                )
+            } else if mode == "ping_pong" {
                 zigzag_unseal_range_with_scratch::<ZigZagTree, _>(
                     &config,
                     PROVER_ID,
@@ -144,6 +184,45 @@ fn unseal_full_unaligned_ranges_and_invalid_bounds() -> anyhow::Result<()> {
             assert!(scratch.iter().all(|b| *b == 0xa5));
         }
     }
+    struct BrokenWriter;
+    impl std::io::Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected writer failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut private = replica.clone();
+    let mut block = vec![0; 17 * 32];
+    assert!(zigzag_unseal_range_with_block::<ZigZagTree, _>(
+        &config,
+        PROVER_ID,
+        SectorId::from(0),
+        TICKET,
+        commitments.comm_d,
+        &mut private,
+        &mut block,
+        BrokenWriter,
+        UnpaddedByteIndex(0),
+        UnpaddedBytesAmount(2032),
+    )
+    .is_err());
+    private.copy_from_slice(&replica);
+    let mut output = Vec::new();
+    zigzag_unseal_range_with_block::<ZigZagTree, _>(
+        &config,
+        PROVER_ID,
+        SectorId::from(0),
+        TICKET,
+        commitments.comm_d,
+        &mut private,
+        &mut block,
+        &mut output,
+        UnpaddedByteIndex(0),
+        UnpaddedBytesAmount(2032),
+    )?;
+    assert_eq!(output, raw);
     Ok(())
 }
 
