@@ -11,9 +11,9 @@ use crate::{
 
 pub const NAME: &str = "zigzag-512";
 pub const LAYERS: usize = 17;
-pub const PARTITIONS: u8 = 45;
+pub const PARTITIONS: u8 = 63;
 pub const MINIMUM_CHALLENGES: usize = 750;
-// Round up per partition: 45 * 17 = 765 challenges per layer.
+// Round up per partition: 63 * 12 = 756 challenges per layer.
 pub const CHALLENGES_PER_LAYER: usize = MINIMUM_CHALLENGES.div_ceil(PARTITIONS as usize);
 pub const DEV_NAME: &str = "zigzag-8";
 pub const DEV_PARTITIONS: u8 = PARTITIONS;
@@ -73,10 +73,10 @@ mod tests {
         let setup = zigzag_setup_params(&config).unwrap();
         assert_eq!(setup.nodes, 1 << 18);
         assert_eq!(setup.layer_challenges.layers(), 17);
-        assert_eq!(config.partitions.0, 45);
+        assert_eq!(config.partitions.0, 63);
         assert_eq!(config.minimum_challenges(), 750);
         for layer in 0..17 {
-            assert_eq!(setup.layer_challenges.challenges_for_layer(layer), 17);
+            assert_eq!(setup.layer_challenges.challenges_for_layer(layer), 12);
         }
         let regular = PoRepConfig::new_groth16(SECTOR_SIZE_8_MIB, [0; 32], ApiVersion::V1_2_0);
         let regular_setup = zigzag_setup_params(&regular).unwrap();
@@ -126,10 +126,10 @@ mod tests {
     fn large_benchmark_budget_preserves_registered_rules_and_layer_overrides() {
         let config = config_32gib([0; 32], ApiVersion::V1_2_0);
         let setup = zigzag_setup_params(&config).unwrap();
-        assert_eq!(config.partitions.0, 45);
+        assert_eq!(config.partitions.0, 63);
         assert_eq!(config.minimum_challenges(), 750);
-        assert_eq!(setup.layer_challenges.challenges_for_layer(0), 17);
-        assert_eq!(usize::from(config.partitions.0) * CHALLENGES_PER_LAYER, 765);
+        assert_eq!(setup.layer_challenges.challenges_for_layer(0), 12);
+        assert_eq!(usize::from(config.partitions.0) * CHALLENGES_PER_LAYER, 756);
         // Unlike the named small-sector profiles, the runner supplies the layer
         // override for 32 GiB. Without it, the registered layer count survives.
         assert_eq!(setup.layer_challenges.layers(), 11);
