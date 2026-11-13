@@ -127,7 +127,11 @@ pub fn zigzag_setup_params(porep_config: &PoRepConfig) -> Result<zigzag::SetupPa
         .get(&u64::from(sector_bytes))
         .expect("unknown sector size");
     #[cfg(feature = "zigzag-bench")]
-    let num_layers = if crate::zigzag_bench::is_config(porep_config) {
+    // Named small-sector profiles have fixed layers; the 32 GiB benchmark
+    // retains the process-local layer override supplied by its runner.
+    let num_layers = if crate::zigzag_bench::is_config(porep_config)
+        && u64::from(sector_bytes) != crate::constants::SECTOR_SIZE_32_GIB
+    {
         crate::zigzag_bench::LAYERS
     } else {
         num_layers
