@@ -837,7 +837,7 @@ where
     hasher.update(graph.porep_id());
     hasher.update((graph.size() as u64).to_le_bytes());
     hasher.update((graph.base_degree() as u64).to_le_bytes());
-    hasher.update((graph.expansion_degree() as u64).to_le_bytes());
+    hasher.update((graph.degree() as u64).to_le_bytes());
     hasher.update([u8::from(graph.reversed())]);
     let api_version = graph.api_version().to_string();
     hasher.update(api_version.as_bytes());

@@ -21,11 +21,13 @@ use storage_proofs_core::{
     PoRepID,
 };
 
-/// The expansion degree used for ZigZag Graphs.
+/// The expansion degree used for ZigZag Graphs: the degree of the Chung permutation. Every edge
+/// is used whichever way the permutation maps it, so a node has up to `2 * EXP_DEGREE` expander
+/// parents.
 pub const EXP_DEGREE: usize = 8;
 
 #[allow(dead_code)]
-pub(crate) const DEGREE: usize = BASE_DEGREE + EXP_DEGREE;
+pub(crate) const DEGREE: usize = BASE_DEGREE + 2 * EXP_DEGREE;
 
 fn derive_feistel_keys(porep_id: PoRepID) -> [u64; 4] {
     let mut feistel_keys = [0u64; 4];
@@ -44,8 +46,9 @@ fn derive_feistel_keys(porep_id: PoRepID) -> [u64; 4] {
 ///
 /// A ZigZag graph is a DRG base graph plus a reversible Feistel-based expansion component. Between
 /// layers the graph is "reversed" (toggling `reversed`), which flips the direction of both the base
-/// DRG edges (via `real_index`) and the expansion edges (via `invert_permute`). This is the defining
-/// property that distinguishes ZigZag from Stacked DRG, which only ever layers forward.
+/// DRG edges (via `real_index`) and the expansion edges (higher instead of lower neighbours become
+/// parents). This is the defining property that distinguishes ZigZag from Stacked DRG, which only
+/// ever layers forward.
 #[derive(Clone)]
 pub struct ZigZagGraph<H, G>
 where
@@ -108,7 +111,7 @@ where
 
         Ok(ZigZagGraph {
             id: format!(
-                "zigzag_graph::ZigZagGraph{{expansion_degree: {} base_graph: {} reversed: {} }}",
+                "zigzag_graph::ZigZagGraph{{expansion_degree: {}x2 base_graph: {} reversed: {} }}",
                 expansion_degree, bg_id, false,
             ),
             base_graph,
@@ -128,7 +131,7 @@ where
         let mut zigzag = self.clone();
         zigzag.reversed = !zigzag.reversed;
         zigzag.id = format!(
-            "zigzag_graph::ZigZagGraph{{expansion_degree: {} base_graph: {} reversed: {} }}",
+            "zigzag_graph::ZigZagGraph{{expansion_degree: {}x2 base_graph: {} reversed: {} }}",
             zigzag.expansion_degree,
             zigzag.base_graph.identifier(),
             zigzag.reversed,
@@ -175,15 +178,14 @@ where
         }
     }
 
-    /// Assign `expansion_degree` parents to `node` using an invertible permutation. The permutation
-    /// is applied in the forward direction for forward layers, and inverted for reversed layers,
-    /// which is what guarantees the expansion edges are exactly reversed between layers.
-    fn correspondent(&self, node: usize, i: usize) -> usize {
+    /// Map slot `i` of `node` through the invertible Chung permutation (or through its inverse) and
+    /// return the node that owns the resulting slot.
+    fn correspondent(&self, node: usize, i: usize, invert: bool) -> usize {
         let a = (node * self.expansion_degree) as feistel::Index + i as feistel::Index;
         let feistel_domain =
             self.size() as feistel::Index * self.expansion_degree as feistel::Index;
 
-        let transformed = if self.reversed {
+        let transformed = if invert {
             feistel::invert_permute(
                 feistel_domain,
                 a,
@@ -201,10 +203,15 @@ where
         transformed as usize / self.expansion_degree
     }
 
+    /// The full ZigZag expander (rust-fil-proofs#827): `node` is joined to every node its slots map
+    /// to under the permutation and under its inverse. Forward layers keep the lower neighbours as
+    /// parents and reversed layers the higher ones, so the expansion edges are exactly reversed
+    /// between layers.
     fn generate_expanded_parents(&self, node: usize) -> Vec<u32> {
-        (0..self.expansion_degree)
+        (0..2 * self.expansion_degree)
             .filter_map(|i| {
-                let other = self.correspondent(node, i);
+                let invert = i >= self.expansion_degree;
+                let other = self.correspondent(node, i % self.expansion_degree, invert);
                 if self.reversed {
                     if other > node {
                         Some(other as u32)
@@ -247,7 +254,7 @@ where
     }
 
     fn degree(&self) -> usize {
-        self.base_graph.degree() + self.expansion_degree
+        self.base_graph.degree() + 2 * self.expansion_degree
     }
 
     #[inline]
@@ -416,6 +423,32 @@ mod tests {
                 "reverse parent below node {}",
                 node
             );
+        }
+    }
+
+    // Regression test for rust-fil-proofs#827: every edge of the Chung permutation must be in the
+    // graph, whichever way the permutation maps it. The pre-fix graph dropped the edges whose image
+    // had the higher index, which left only half of the expander.
+    #[test]
+    fn zigzag_expansion_uses_every_permutation_edge() {
+        let nodes = 64;
+        let porep_id = [4u8; 32];
+        let forward: ZigZagBucketGraph<PoseidonHasher> =
+            ZigZagGraph::new_zigzag(None, nodes, BASE_DEGREE, EXP_DEGREE, porep_id, ApiVersion::V1_2_0)
+                .expect("failed to create graph");
+        assert_eq!(forward.degree(), BASE_DEGREE + 2 * EXP_DEGREE);
+
+        for node in 0..nodes {
+            for i in 0..EXP_DEGREE {
+                let other = forward.correspondent(node, i, false);
+                let (low, high) = (node.min(other), node.max(other));
+                assert!(
+                    low == high || forward.generate_expanded_parents(high).contains(&(low as u32)),
+                    "permutation edge between {} and {} is missing",
+                    node,
+                    other
+                );
+            }
         }
     }
 
