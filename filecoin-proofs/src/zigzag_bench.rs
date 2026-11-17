@@ -10,10 +10,10 @@ use crate::{
 };
 
 pub const NAME: &str = "zigzag-512";
-pub const LAYERS: usize = 17;
-pub const PARTITIONS: u8 = 63;
-pub const MINIMUM_CHALLENGES: usize = 750;
-// Round up per partition: 63 * 12 = 756 challenges per layer.
+pub const LAYERS: usize = 13;
+pub const PARTITIONS: u8 = 36;
+pub const MINIMUM_CHALLENGES: usize = 530;
+// Round up per partition: 36 * 15 = 540 challenges per layer.
 pub const CHALLENGES_PER_LAYER: usize = MINIMUM_CHALLENGES.div_ceil(PARTITIONS as usize);
 pub const DEV_NAME: &str = "zigzag-8";
 pub const DEV_PARTITIONS: u8 = PARTITIONS;
@@ -22,7 +22,7 @@ pub const DEV_MINIMUM_CHALLENGES: usize = MINIMUM_CHALLENGES;
 static POREP_ID: OnceLock<[u8; 32]> = OnceLock::new();
 
 /// Benchmark-only 32 GiB challenge budget; layer count follows the process-local
-/// sector settings so the runner can select 17 layers or an explicit override.
+/// sector settings so the runner can select 13 layers or an explicit override.
 pub fn config_32gib(porep_id: [u8; 32], api_version: ApiVersion) -> PoRepConfig {
     assert_eq!(*POREP_ID.get_or_init(|| porep_id), porep_id);
     let mut config = PoRepConfig::new_groth16(SECTOR_SIZE_32_GIB, porep_id, api_version);
@@ -72,11 +72,11 @@ mod tests {
         let config = config_8mib([0; 32], ApiVersion::V1_2_0);
         let setup = zigzag_setup_params(&config).unwrap();
         assert_eq!(setup.nodes, 1 << 18);
-        assert_eq!(setup.layer_challenges.layers(), 17);
-        assert_eq!(config.partitions.0, 63);
-        assert_eq!(config.minimum_challenges(), 750);
-        for layer in 0..17 {
-            assert_eq!(setup.layer_challenges.challenges_for_layer(layer), 12);
+        assert_eq!(setup.layer_challenges.layers(), 13);
+        assert_eq!(config.partitions.0, 36);
+        assert_eq!(config.minimum_challenges(), 530);
+        for layer in 0..13 {
+            assert_eq!(setup.layer_challenges.challenges_for_layer(layer), 15);
         }
         let regular = PoRepConfig::new_groth16(SECTOR_SIZE_8_MIB, [0; 32], ApiVersion::V1_2_0);
         let regular_setup = zigzag_setup_params(&regular).unwrap();
@@ -103,7 +103,7 @@ mod tests {
         assert_eq!(setup.expansion_degree, reference_setup.expansion_degree);
         assert_eq!(setup.porep_id, reference_setup.porep_id);
         assert_eq!(setup.api_version, reference_setup.api_version);
-        // The benchmark has 17 layers; registered 32 GiB proofs retain 11.
+        // The benchmark has 13 layers; registered 32 GiB proofs retain 11.
         assert_eq!(reference_setup.layer_challenges.layers(), 11);
         assert_eq!(reference_setup.layer_challenges.challenges_for_layer(0), 18);
         assert_eq!(reference.partitions.0, 10);
@@ -126,10 +126,10 @@ mod tests {
     fn large_benchmark_budget_preserves_registered_rules_and_layer_overrides() {
         let config = config_32gib([0; 32], ApiVersion::V1_2_0);
         let setup = zigzag_setup_params(&config).unwrap();
-        assert_eq!(config.partitions.0, 63);
-        assert_eq!(config.minimum_challenges(), 750);
-        assert_eq!(setup.layer_challenges.challenges_for_layer(0), 12);
-        assert_eq!(usize::from(config.partitions.0) * CHALLENGES_PER_LAYER, 756);
+        assert_eq!(config.partitions.0, 36);
+        assert_eq!(config.minimum_challenges(), 530);
+        assert_eq!(setup.layer_challenges.challenges_for_layer(0), 15);
+        assert_eq!(usize::from(config.partitions.0) * CHALLENGES_PER_LAYER, 540);
         // Unlike the named small-sector profiles, the runner supplies the layer
         // override for 32 GiB. Without it, the registered layer count survives.
         assert_eq!(setup.layer_challenges.layers(), 11);
