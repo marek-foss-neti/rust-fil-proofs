@@ -1,9 +1,11 @@
 use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
+use std::sync::{Arc, OnceLock};
 
 use std::convert::TryInto;
 
-use anyhow::ensure;
+use anyhow::{bail, ensure, Context};
+use blake2b_simd::blake2b;
 use filecoin_hashers::Hasher;
 use fr32::bytes_into_fr_repr_safe;
 use sha2::{Digest, Sha256};
@@ -42,6 +44,122 @@ fn derive_feistel_keys(porep_id: PoRepID) -> [u64; 4] {
     feistel_keys
 }
 
+/// `FIL_PROOFS_ZIGZAG_FEISTEL_TABLE` selects how the expander permutation is computed: with the
+/// tabulated round function (`1`, the default) or with the Blake2b round function of `feistel.rs`
+/// (`0`). Both give the same permutation; the tests use `feistel.rs` as the reference.
+fn feistel_table_enabled() -> Result<bool> {
+    match std::env::var("FIL_PROOFS_ZIGZAG_FEISTEL_TABLE") {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => bail!("FIL_PROOFS_ZIGZAG_FEISTEL_TABLE must be a boolean"),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Err(error) => Err(error).context("invalid FIL_PROOFS_ZIGZAG_FEISTEL_TABLE"),
+    }
+}
+
+/// The round function of `feistel::permute` and `feistel::invert_permute`, tabulated.
+///
+/// Every Feistel round hashes one half of the index together with the round key (Blake2b). The
+/// result depends only on that half and on the key, so one table entry per half and round gives the
+/// same permutation without hashing. For 32 GiB and 64 GiB sectors a half has 17 bits, which makes
+/// 3 * 2^17 `u32` values (1.5 MiB).
+struct FeistelTable {
+    rounds: Box<[u32]>,
+    left_mask: feistel::Index,
+    right_mask: feistel::Index,
+    half_bits: usize,
+}
+
+impl FeistelTable {
+    fn new(keys: &[feistel::Index], precomputed: FeistelPrecomputed) -> Self {
+        let (left_mask, right_mask, half_bits) = precomputed;
+        // A graph has at most 2^32 nodes with 8 slots each, so a half has at most 18 bits.
+        assert!(half_bits <= 18, "Feistel table too large");
+        let half_bits = half_bits as usize;
+        let halves = 1usize << half_bits;
+
+        let mut rounds = vec![0u32; feistel::FEISTEL_ROUNDS * halves];
+        for (round, key) in keys.iter().take(feistel::FEISTEL_ROUNDS).enumerate() {
+            // The same input and output bytes as the round function in `feistel.rs`.
+            let mut data = [0u8; 16];
+            data[8..].copy_from_slice(&key.to_be_bytes());
+            for half in 0..halves {
+                data[..8].copy_from_slice(&(half as feistel::Index).to_be_bytes());
+                let hash = blake2b(&data);
+                let head: [u8; 8] = hash.as_bytes()[..8].try_into().expect("8 bytes");
+                rounds[round * halves + half] =
+                    (feistel::Index::from_be_bytes(head) & right_mask) as u32;
+            }
+        }
+
+        FeistelTable {
+            rounds: rounds.into_boxed_slice(),
+            left_mask,
+            right_mask,
+            half_bits,
+        }
+    }
+
+    #[inline]
+    fn round(&self, round: usize, half: feistel::Index) -> feistel::Index {
+        feistel::Index::from(self.rounds[(round << self.half_bits) | half as usize])
+    }
+
+    /// `encode` of `feistel.rs`.
+    #[inline]
+    fn encode(&self, index: feistel::Index) -> feistel::Index {
+        let mut left = (index & self.left_mask) >> self.half_bits;
+        let mut right = index & self.right_mask;
+
+        for round in 0..feistel::FEISTEL_ROUNDS {
+            let (l, r) = (right, left ^ self.round(round, right));
+            left = l;
+            right = r;
+        }
+
+        (left << self.half_bits) | right
+    }
+
+    /// `decode` of `feistel.rs`.
+    #[inline]
+    fn decode(&self, index: feistel::Index) -> feistel::Index {
+        let mut left = (index & self.left_mask) >> self.half_bits;
+        let mut right = index & self.right_mask;
+
+        for round in (0..feistel::FEISTEL_ROUNDS).rev() {
+            let (l, r) = (right ^ self.round(round, left), left);
+            left = l;
+            right = r;
+        }
+
+        (left << self.half_bits) | right
+    }
+
+    /// `feistel::permute`: images outside the domain are permuted again.
+    fn permute(&self, num_elements: feistel::Index, index: feistel::Index) -> feistel::Index {
+        let mut u = self.encode(index);
+        while u >= num_elements {
+            u = self.encode(u);
+        }
+        u
+    }
+
+    /// `feistel::invert_permute`.
+    fn invert_permute(
+        &self,
+        num_elements: feistel::Index,
+        index: feistel::Index,
+    ) -> feistel::Index {
+        let mut u = self.decode(index);
+        while u >= num_elements {
+            u = self.decode(u);
+        }
+        u
+    }
+}
+
 /// A ZigZag graph.
 ///
 /// A ZigZag graph is a DRG base graph plus a reversible Feistel-based expansion component. Between
@@ -60,6 +178,9 @@ where
     pub reversed: bool,
     feistel_keys: [feistel::Index; 4],
     feistel_precomputed: FeistelPrecomputed,
+    /// Built on first use and shared by the forward and the reversed graph; `None` when
+    /// `FIL_PROOFS_ZIGZAG_FEISTEL_TABLE` is off.
+    feistel_table: Option<Arc<OnceLock<FeistelTable>>>,
     porep_id: PoRepID,
     api_version: ApiVersion,
     id: String,
@@ -108,6 +229,11 @@ where
 
         let bg_id = base_graph.identifier();
         let feistel_keys = derive_feistel_keys(porep_id);
+        let feistel_table = if feistel_table_enabled()? {
+            Some(Arc::new(OnceLock::new()))
+        } else {
+            None
+        };
 
         Ok(ZigZagGraph {
             id: format!(
@@ -119,6 +245,7 @@ where
             reversed: false,
             feistel_keys,
             feistel_precomputed: feistel::precompute((expansion_degree * nodes) as feistel::Index),
+            feistel_table,
             porep_id,
             api_version,
             _h: PhantomData,
@@ -185,6 +312,17 @@ where
         let feistel_domain =
             self.size() as feistel::Index * self.expansion_degree as feistel::Index;
 
+        if let Some(table) = self.feistel_table.as_ref() {
+            let table = table
+                .get_or_init(|| FeistelTable::new(&self.feistel_keys, self.feistel_precomputed));
+            let transformed = if invert {
+                table.invert_permute(feistel_domain, a)
+            } else {
+                table.permute(feistel_domain, a)
+            };
+            return transformed as usize / self.expansion_degree;
+        }
+
         let transformed = if invert {
             feistel::invert_permute(
                 feistel_domain,
@@ -207,24 +345,22 @@ where
     /// to under the permutation and under its inverse. Forward layers keep the lower neighbours as
     /// parents and reversed layers the higher ones, so the expansion edges are exactly reversed
     /// between layers.
-    fn generate_expanded_parents(&self, node: usize) -> Vec<u32> {
-        (0..2 * self.expansion_degree)
-            .filter_map(|i| {
-                let invert = i >= self.expansion_degree;
-                let other = self.correspondent(node, i % self.expansion_degree, invert);
-                if self.reversed {
-                    if other > node {
-                        Some(other as u32)
-                    } else {
-                        None
-                    }
-                } else if other < node {
+    fn generate_expanded_parents(&self, node: usize) -> impl Iterator<Item = u32> + '_ {
+        (0..2 * self.expansion_degree).filter_map(move |i| {
+            let invert = i >= self.expansion_degree;
+            let other = self.correspondent(node, i % self.expansion_degree, invert);
+            if self.reversed {
+                if other > node {
                     Some(other as u32)
                 } else {
                     None
                 }
-            })
-            .collect()
+            } else if other < node {
+                Some(other as u32)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -270,13 +406,13 @@ where
             *parent = self.real_index(*parent as usize) as u32;
         }
 
-        let expanded_parents = self.generate_expanded_parents(raw_node);
-        for (ii, value) in expanded_parents.iter().enumerate() {
-            parents[base_degree + ii] = *value;
+        let mut current_length = base_degree;
+        for parent in self.generate_expanded_parents(raw_node) {
+            parents[current_length] = parent;
+            current_length += 1;
         }
 
         // Pad so all nodes have the correct degree.
-        let current_length = base_degree + expanded_parents.len();
         let pad_value = if self.reversed {
             (self.size() - 1) as u32
         } else {
@@ -443,7 +579,10 @@ mod tests {
                 let other = forward.correspondent(node, i, false);
                 let (low, high) = (node.min(other), node.max(other));
                 assert!(
-                    low == high || forward.generate_expanded_parents(high).contains(&(low as u32)),
+                    low == high
+                        || forward
+                            .generate_expanded_parents(high)
+                            .any(|parent| parent == low as u32),
                     "permutation edge between {} and {} is missing",
                     node,
                     other
@@ -480,6 +619,160 @@ mod tests {
                     node,
                     parent
                 );
+            }
+        }
+    }
+
+    // The tabulated round function must give exactly the permutation of `feistel.rs`, including
+    // the repeated rounds for images outside the domain. Every slot of small domains, both those
+    // that are powers of four (16, 4096) and those that are not.
+    #[test]
+    fn feistel_table_matches_feistel_permutation() {
+        let keys = derive_feistel_keys([5u8; 32]);
+
+        for &num_elements in [8u64, 16, 40, 512, 800, 2048, 4096, 8000].iter() {
+            let precomputed = feistel::precompute(num_elements);
+            let table = FeistelTable::new(&keys, precomputed);
+
+            for index in 0..num_elements {
+                let image = feistel::permute(num_elements, index, &keys, precomputed);
+                assert_eq!(
+                    table.permute(num_elements, index),
+                    image,
+                    "permute({}) in a domain of {}",
+                    index,
+                    num_elements
+                );
+                assert_eq!(
+                    table.invert_permute(num_elements, index),
+                    feistel::invert_permute(num_elements, index, &keys, precomputed),
+                    "invert_permute({}) in a domain of {}",
+                    index,
+                    num_elements
+                );
+                assert_eq!(table.invert_permute(num_elements, image), index);
+            }
+        }
+    }
+
+    // The same comparison for the slot domains of 32 GiB and 64 GiB sectors, on a sample of slots.
+    #[test]
+    fn feistel_table_matches_feistel_permutation_for_large_sectors() {
+        let keys = derive_feistel_keys([6u8; 32]);
+
+        for &nodes in [1u64 << 30, 1u64 << 31].iter() {
+            let num_elements = nodes * EXP_DEGREE as u64;
+            let precomputed = feistel::precompute(num_elements);
+            let table = FeistelTable::new(&keys, precomputed);
+
+            let mut indices: Vec<u64> = (0..4096u64)
+                .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % num_elements)
+                .collect();
+            indices.extend_from_slice(&[0, 1, num_elements - 2, num_elements - 1]);
+
+            for &index in indices.iter() {
+                assert_eq!(
+                    table.permute(num_elements, index),
+                    feistel::permute(num_elements, index, &keys, precomputed),
+                    "permute({}) for {} nodes",
+                    index,
+                    nodes
+                );
+                assert_eq!(
+                    table.invert_permute(num_elements, index),
+                    feistel::invert_permute(num_elements, index, &keys, precomputed),
+                    "invert_permute({}) for {} nodes",
+                    index,
+                    nodes
+                );
+            }
+        }
+    }
+
+    // `parents` must return what a direct computation with `feistel.rs` returns, in both
+    // orientations, with the table and without it: base parents, expander neighbours on the allowed
+    // side, padding and order.
+    #[test]
+    fn zigzag_parents_match_feistel_reference() {
+        let porep_id = [7u8; 32];
+        let keys = derive_feistel_keys(porep_id);
+
+        for &nodes in [64usize, 256, 2048].iter() {
+            let forward: ZigZagBucketGraph<PoseidonHasher> = ZigZagGraph::new_zigzag(
+                None,
+                nodes,
+                BASE_DEGREE,
+                EXP_DEGREE,
+                porep_id,
+                ApiVersion::V1_2_0,
+            )
+            .expect("failed to create graph");
+            let domain = (nodes * EXP_DEGREE) as feistel::Index;
+            let precomputed = feistel::precompute(domain);
+
+            for graph in [forward.clone(), forward.zigzag()].iter() {
+                let mut with_table = graph.clone();
+                with_table.feistel_table = Some(Arc::new(OnceLock::new()));
+                let mut without_table = graph.clone();
+                without_table.feistel_table = None;
+
+                let mut parents = vec![0u32; graph.degree()];
+                for node in 0..nodes {
+                    let mut expected = vec![0u32; BASE_DEGREE];
+                    graph
+                        .base_graph()
+                        .parents(graph.real_index(node), &mut expected)
+                        .expect("base parents failed");
+                    for parent in expected.iter_mut() {
+                        *parent = graph.real_index(*parent as usize) as u32;
+                    }
+                    for slot in 0..EXP_DEGREE {
+                        let index = (node * EXP_DEGREE + slot) as feistel::Index;
+                        let images = [
+                            feistel::permute(domain, index, &keys, precomputed),
+                            feistel::invert_permute(domain, index, &keys, precomputed),
+                        ];
+                        for image in images.iter() {
+                            let other = *image as usize / EXP_DEGREE;
+                            if (graph.reversed() && other > node)
+                                || (graph.forward() && other < node)
+                            {
+                                expected.push(other as u32);
+                            }
+                        }
+                    }
+                    let pad = if graph.reversed() {
+                        (nodes - 1) as u32
+                    } else {
+                        0
+                    };
+                    expected.resize(graph.degree(), pad);
+                    expected.sort_unstable();
+                    if graph.reversed() {
+                        expected.reverse();
+                    }
+
+                    with_table
+                        .parents(node, &mut parents)
+                        .expect("parents failed");
+                    assert_eq!(
+                        parents,
+                        expected,
+                        "node {} with the table (reversed: {})",
+                        node,
+                        graph.reversed()
+                    );
+                    without_table
+                        .parents(node, &mut parents)
+                        .expect("parents failed");
+                    assert_eq!(
+                        parents,
+                        expected,
+                        "node {} without the table (reversed: {})",
+                        node,
+                        graph.reversed()
+                    );
+                }
             }
         }
     }
