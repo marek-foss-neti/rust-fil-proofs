@@ -96,7 +96,7 @@ impl DecodeRamAdmission {
         sector_bytes: usize,
         block_bytes: usize,
         parent_buffer_bytes: usize,
-        active_table_bytes: usize,
+        parent_table_reserve_bytes: usize,
     ) -> Result<Self> {
         let guard = match RAM_DECODE.try_lock() {
             Ok(guard) => guard,
@@ -112,12 +112,16 @@ impl DecodeRamAdmission {
             sector_bytes,
             block_bytes,
             parent_buffer_bytes,
-            active_table_bytes,
+            parent_table_reserve_bytes,
             available,
         )?;
         log::info!(target: "zigzag_unseal", "zigzag_decode_state {}", serde_json::json!({
             "event": "ram_admission", "available_bytes": available, "required_bytes": required,
             "accepted": required <= available, "resources": resources,
+            "sector_bytes": sector_bytes, "block_and_output_bytes": block_bytes,
+            "parent_buffer_bytes": parent_buffer_bytes,
+            "parent_table_reserve_bytes": parent_table_reserve_bytes,
+            "headroom_reserve_bytes": (available / 10).max(1 << 30),
         }));
         ensure!(required <= available, "ZigZag RAM decode needs {required} bytes including reserve; only {available} available");
         Ok(Self { _guard: guard })
@@ -131,8 +135,9 @@ fn required_ram(
     table: usize,
     available: u64,
 ) -> Result<u64> {
-    // Include one active read-only table, all owned buffers and allocator/runtime/I/O
-    // headroom. Inactive clean file pages are reclaimable; dirty pages are not.
+    // Include all owned buffers, the reader-specific table allowance and
+    // allocator/runtime/I/O headroom. Buffered parent tables do not need to stay
+    // resident: their clean file pages can be reclaimed. This is not a page-cache cap.
     let mut required = (available / 10).max(1 << 30);
     for bytes in [sector, block, parents, table] {
         required = required
@@ -167,6 +172,46 @@ mod tests {
             100 * gib as u64 + (128 * MIB) as u64
         );
         assert!(required_ram(usize::MAX, 1, 1, 1, u64::MAX).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn buffered_admission_fits_full_graph_with_bounded_headroom() -> Result<()> {
+        use crate::zigzag::{DecodeConfig, DecodeParentReader};
+        let gib = 1usize << 30;
+        // Include block, streamed FR32 output and CPU scratch.
+        let available = 96_163_864_576;
+        let buffers = 128 * MIB + 2 * MIB;
+        for parent_reader in [
+            DecodeParentReader::Buffered,
+            DecodeParentReader::Mmap,
+            DecodeParentReader::Legacy,
+        ] {
+            let config = DecodeConfig {
+                parent_reader,
+                parent_buffer_mib: 64,
+            };
+            let required = required_ram(
+                32 * gib,
+                buffers,
+                64 * MIB,
+                config.parent_table_reserve_bytes(88 * gib),
+                available,
+            )?;
+            assert_eq!(
+                required <= available,
+                parent_reader == DecodeParentReader::Buffered
+            );
+            assert!(
+                required_ram(
+                    32 * gib,
+                    buffers,
+                    64 * MIB,
+                    config.parent_table_reserve_bytes(88 * gib),
+                    32 * gib as u64
+                )? > 32 * gib as u64
+            );
+        }
         Ok(())
     }
 }

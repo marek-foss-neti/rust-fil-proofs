@@ -52,6 +52,17 @@ impl Default for DecodeConfig {
 }
 
 impl DecodeConfig {
+    /// Extra table residency reserved by the private-state RAM adapter. Buffered
+    /// reads own only the bounded record buffers, counted separately by admission.
+    /// Their clean page-cache pages are reclaimable, not a required resident table.
+    /// Keep the conservative table allowance for the mapped/reference readers.
+    pub fn parent_table_reserve_bytes(self, table_bytes: usize) -> usize {
+        match self.parent_reader {
+            DecodeParentReader::Buffered => 0,
+            DecodeParentReader::Legacy | DecodeParentReader::Mmap => table_bytes,
+        }
+    }
+
     pub fn from_env() -> Result<Self> {
         Self::parse(
             &std::env::var("FIL_PROOFS_ZIGZAG_DECODE_PARENT_READER")
@@ -222,10 +233,22 @@ impl DecodeParentSource {
         } else {
             None
         };
+        let page_cache_advice = if mode == DecodeParentReader::Buffered {
+            match advise_streaming(file.as_ref()) {
+                Ok(()) => "noreuse_requested",
+                Err(error) => {
+                    log::debug!(target: "zigzag_unseal", "decode parent NOREUSE unavailable: {error}");
+                    "unavailable"
+                }
+            }
+        } else {
+            "unchanged"
+        };
         log::info!(target: "zigzag_unseal", "zigzag_decode_parents {}", serde_json::json!({
             "event": "open", "reader": mode, "reversed": graph.reversed(),
             "nodes": graph.size(), "bytes": bytes, "source_opens": 1,
             "mappings": usize::from(mapping.is_some()), "remaps": 0,
+            "page_cache_advice": page_cache_advice,
             "elapsed_ns": started.elapsed().as_nanos(), "locks": locks,
         }));
         Ok(Self {
@@ -262,6 +285,27 @@ impl DecodeParentSource {
             stats: ReadStats::default(),
         })
     }
+}
+
+// On Linux >= 6.3 NOREUSE avoids promoting this stream's pages during reclaim.
+// Unlike DONTNEED it does not evict shared cache eagerly, so a warm table can
+// still be reused by later layers/other readers when memory permits. Older
+// kernels may ignore the hint; RAM admission does not depend on its success.
+#[cfg(target_os = "linux")]
+fn advise_streaming(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // Offset/length zero intentionally apply to the whole validated descriptor.
+    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_NOREUSE) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_streaming(_file: &File) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -438,6 +482,41 @@ mod tests {
         }
         assert!(DecodeConfig::default().layout(0, 14, 1).is_err());
         assert!(DecodeConfig::default().layout(10, usize::MAX, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn buffered_admission_does_not_reserve_the_whole_parent_table() -> Result<()> {
+        for degree in [14, 22] {
+            let table_bytes = (1usize << 30) * degree * 4;
+            for reader in ["legacy", "mmap", "buffered"] {
+                let config = DecodeConfig::parse(reader, "64")?;
+                assert_eq!(config.parent_table_reserve_bytes(0), 0);
+                assert_eq!(
+                    config.parent_table_reserve_bytes(table_bytes),
+                    if reader == "buffered" { 0 } else { table_bytes }
+                );
+                for workers in [1, 64, 128] {
+                    let layout = config.layout(1 << 30, degree, workers)?;
+                    assert!(layout.buffer_bytes <= 64 * MIB);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streaming_advice_preserves_file_contents_and_position() -> Result<()> {
+        use std::io::{Read, Write};
+        let mut file = tempfile::tempfile()?;
+        file.write_all(b"parent table")?;
+        file.seek(SeekFrom::Start(3))?;
+        advise_streaming(&file)?;
+        assert_eq!(file.stream_position()?, 3);
+        let mut remaining = String::new();
+        file.read_to_string(&mut remaining)?;
+        assert_eq!(remaining, "ent table");
         Ok(())
     }
 
