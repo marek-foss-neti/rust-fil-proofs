@@ -34,6 +34,7 @@ use crate::{
 
 mod fake_seal;
 mod post_util;
+mod sdr_v2;
 mod seal;
 mod update;
 mod util;
@@ -43,6 +44,7 @@ mod zigzag;
 
 pub use fake_seal::*;
 pub use post_util::*;
+pub use sdr_v2::*;
 pub use seal::*;
 pub use update::*;
 pub use util::*;

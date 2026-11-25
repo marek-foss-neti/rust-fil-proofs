@@ -1186,7 +1186,7 @@ pub fn zigzag_unseal_range_streaming<Tree: 'static + MerkleTreeTrait, W: Write>(
     Ok(UnpaddedBytesAmount(output.finish()? as u64))
 }
 
-fn validate_zigzag_unseal_range(
+pub(super) fn validate_zigzag_unseal_range(
     padded_len: usize,
     offset: UnpaddedByteIndex,
     num_bytes: UnpaddedBytesAmount,
@@ -1200,7 +1200,7 @@ fn validate_zigzag_unseal_range(
     Ok(())
 }
 
-fn write_zigzag_unseal_range<W: Write>(
+pub(super) fn write_zigzag_unseal_range<W: Write>(
     decoded: &[u8],
     output: &mut W,
     offset: UnpaddedByteIndex,

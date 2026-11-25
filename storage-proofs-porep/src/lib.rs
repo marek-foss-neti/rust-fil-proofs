@@ -3,6 +3,7 @@
 #![cfg_attr(all(target_arch = "aarch64", nightly), feature(stdsimd))]
 #![warn(clippy::unnecessary_wraps)]
 
+pub mod sdr_v2;
 pub mod stacked;
 pub mod zigzag;
 
